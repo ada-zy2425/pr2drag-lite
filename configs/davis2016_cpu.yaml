@@ -1,0 +1,46 @@
+seed: 0
+
+paths:
+  davis_root: /content/drive/MyDrive/DAVIS_unzipped/DAVIS
+  res: 480p
+  base_out: /content/drive/MyDrive/pr2drag_data
+
+io:
+  overwrite: false
+  skip_if_exists: true
+  verbose_skip: true
+
+label:
+  iou_thr: 0.5
+  empty_ok: false
+
+flow:
+  downscale: 0.5
+  farneback:
+    pyr_scale: 0.5
+    levels: 3
+    winsize: 25
+    iterations: 3
+    poly_n: 5
+    poly_sigma: 1.2
+    flags: 0
+
+sp:
+  trans_p01: 0.05
+  trans_p10: 0.05
+  pi1: 0.99
+  ece_bins: 15
+
+aob:
+  tau_mode: quantile
+  tau_fixed: 0.45
+  low_frac_target: 0.25
+  tau_min: 1.0e-6
+  tau_max: 0.999999
+  eta_l: 0.01
+  eta_u: 0.6
+  eps_gate: 0.05
+  abstain_mode: hold
+
+metrics:
+  fail_thresh: 20.0
