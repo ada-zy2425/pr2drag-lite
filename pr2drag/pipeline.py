@@ -61,11 +61,84 @@ def _resolve_davis_root(davis_root: Union[str, Path]) -> Path:
         "  or parent containing davis_root/DAVIS/...\n"
     )
 
+def _parse_seq_from_split_line(line: str) -> str | None:
+    """
+    Robustly parse a DAVIS sequence name from a line.
+    Supports:
+      - "bear" (official ImageSets/*.txt)
+      - "bear/00000.jpg"
+      - "/.../JPEGImages/480p/bear/00000.jpg /.../Annotations/480p/bear/00000.png"
+    """
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+
+    # many broken lists have 2 columns: "img_path anno_path"
+    tok = s.split()[0]
+
+    p = Path(tok)
+
+    # Case: path contains ".../JPEGImages/{res}/{seq}/{frame}"
+    parts = p.parts
+    if "JPEGImages" in parts:
+        i = parts.index("JPEGImages")
+        # expect: JPEGImages / res / seq / frame
+        if len(parts) >= i + 3:
+            return parts[i + 2]
+
+    # Case: "bear/00000.jpg" or ".../bear/00000.jpg"
+    low = tok.lower()
+    if low.endswith((".jpg", ".jpeg", ".png")):
+        if p.parent.name:
+            return p.parent.name
+
+    # Case: "bear/xxxx" without extension
+    if "/" in tok or "\\" in tok:
+        return Path(tok).parts[0]
+
+    # Case: already a seq name
+    return tok
+
+
 def _list_seq_from_split(davis_root: Path, split_rel: str) -> List[str]:
-    split_path = davis_split_path(davis_root, split_rel)
+    """
+    Read split file and return UNIQUE sequence names in stable order.
+    If the split file is accidentally a frame-level list (≈2079 lines),
+    we still recover the 30 unique sequence names.
+    """
+    split_path = Path(split_rel)
+    if not split_path.is_absolute():
+        split_path = davis_root / split_path
     if not split_path.exists():
         raise FileNotFoundError(f"[DAVIS] split file not found: {split_path}")
-    return read_txt_lines(split_path)
+
+    lines = read_txt_lines(split_path)
+
+    seqs: List[str] = []
+    seen: set[str] = set()
+    bad: int = 0
+
+    for ln in lines:
+        seq = _parse_seq_from_split_line(ln)
+        if seq is None:
+            continue
+        # safety: prevent obviously invalid seq strings
+        if " " in seq or seq.lower().endswith((".jpg", ".png")):
+            bad += 1
+            continue
+        if seq not in seen:
+            seen.add(seq)
+            seqs.append(seq)
+
+    # Helpful log (this will explain the 2079 -> 30 situation)
+    print(f"[Stage1:{'train' if 'train' in split_path.name else 'val'}] split={split_path} "
+          f"num_lines={len(lines)} num_seqs(dedup)={len(seqs)} bad_lines={bad}")
+
+    if len(seqs) == 0:
+        raise RuntimeError(f"[DAVIS] No valid sequences parsed from split file: {split_path}")
+
+    return seqs
+
 
 
 def davis_frame_paths(davis_root: Union[str, Path], res: str, seq: str) -> Tuple[List[Path], List[Path]]:
