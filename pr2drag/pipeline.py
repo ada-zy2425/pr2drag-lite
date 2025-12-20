@@ -1,593 +1,533 @@
 from __future__ import annotations
 
-import os
+import math
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from PIL import Image
-import imageio.v2 as imageio
 from tqdm import tqdm
 
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+
+from .aob import AoBParams, aob_fill
+from .evidence import build_sequence_evidence
+from .eval import compute_seq_metrics, metrics_to_row
+from .sp import HMMParams, emission_metrics, fit_emission_model, forward_backward_binary
 from .utils import (
-    ensure_dir,
-    get_logger,
-    read_split_list,
-    save_json,
-    load_npz,
-    save_npz_atomic,
-    signature_for_stage,
-    is_compatible_npz,
-    stable_hash_dict,
+    clamp,
+    davis_split_path,
+    npz_read,
+    npz_write,
+    pretty_header,
+    read_txt_lines,
+    resolve_davis_root,
+    safe_mkdir,
+    sha1_of_dict,
+    write_json,
 )
-from .evidence import build_features
-from .sp import fit_emission, build_hmm_params, hmm_smooth_binary
-from .aob import apply_aob
-from .eval import compute_emission_metrics, per_seq_summary, write_analysis
 
 
-def _davis_frame_paths(davis_root: str, res: str, seq: str) -> Tuple[List[str], List[str]]:
-    img_dir = os.path.join(davis_root, "JPEGImages", res, seq)
-    ann_dir = os.path.join(davis_root, "Annotations", res, seq)
-    if not os.path.isdir(img_dir):
-        raise FileNotFoundError(f"Missing DAVIS images dir: {img_dir}")
-    if not os.path.isdir(ann_dir):
-        raise FileNotFoundError(f"Missing DAVIS annotations dir: {ann_dir}")
-
-    # DAVIS uses 5-digit names
-    imgs = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
-    anns = sorted([os.path.join(ann_dir, f) for f in os.listdir(ann_dir) if f.lower().endswith((".png", ".jpg"))])
-
-    if len(imgs) == 0 or len(anns) == 0:
-        raise RuntimeError(f"Empty sequence folders: {seq}")
-    if len(imgs) != len(anns):
-        # Still proceed but align by basename
-        ann_map = {os.path.splitext(os.path.basename(p))[0]: p for p in anns}
-        aligned_anns = []
-        aligned_imgs = []
-        for ip in imgs:
-            k = os.path.splitext(os.path.basename(ip))[0]
-            if k in ann_map:
-                aligned_imgs.append(ip)
-                aligned_anns.append(ann_map[k])
-        imgs, anns = aligned_imgs, aligned_anns
-    return imgs, anns
+def _list_seq_from_split(davis_root: Path, split_rel: str) -> List[str]:
+    split_path = davis_split_path(davis_root, split_rel)
+    if not split_path.exists():
+        raise FileNotFoundError(f"[DAVIS] split file not found: {split_path}")
+    return read_txt_lines(split_path)
 
 
-def _load_rgb(path: str) -> np.ndarray:
-    try:
-        im = imageio.imread(path)
-        if im.ndim == 2:
-            im = np.stack([im, im, im], axis=-1)
-        if im.shape[-1] == 4:
-            im = im[..., :3]
-        return im.astype(np.uint8)
-    except Exception:
-        im = Image.open(path).convert("RGB")
-        return np.array(im, dtype=np.uint8)
-
-
-def _load_mask(path: str) -> np.ndarray:
-    try:
-        m = imageio.imread(path)
-    except Exception:
-        m = np.array(Image.open(path), dtype=np.uint8)
-    if m.ndim == 3:
-        m = m[..., 0]
-    return (m > 0).astype(np.uint8)
-
-
-def _centroid_from_mask(mask: np.ndarray) -> Tuple[float, float, bool]:
-    ys, xs = np.nonzero(mask)
-    if ys.size == 0:
-        return float("nan"), float("nan"), True
-    return float(xs.mean()), float(ys.mean()), False
-
-
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    # img uint8 HxWx3
-    img = img.astype(np.float32) / 255.0
-    return 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
-
-
-def _hann2d(H: int, W: int) -> np.ndarray:
-    wy = np.hanning(H)
-    wx = np.hanning(W)
-    return np.outer(wy, wx).astype(np.float32)
-
-
-def _phase_correlation_shift(a: np.ndarray, b: np.ndarray, use_hann: bool = True, eps: float = 1e-9) -> Tuple[float, float, float]:
+def davis_frame_paths(davis_root: Path, res: str, seq: str) -> Tuple[List[Path], List[Path]]:
     """
-    Estimate global translation shift from a->b using phase correlation.
-    Returns (dx, dy, peak) where dx,dy are in pixels.
+    DAVIS layout:
+      davis_root/JPEGImages/480p/<seq>/00000.jpg
+      davis_root/Annotations/480p/<seq>/00000.png
     """
-    # a,b: gray float32
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    H, W = a.shape
-    if use_hann:
-        win = _hann2d(H, W)
-        a = a * win
-        b = b * win
-    Fa = np.fft.fft2(a)
-    Fb = np.fft.fft2(b)
-    R = Fa * np.conj(Fb)
-    denom = np.abs(R)
-    R = R / (denom + eps)
-    r = np.fft.ifft2(R)
-    r = np.abs(r)
-    peak = float(np.max(r))
-    maxpos = np.unravel_index(np.argmax(r), r.shape)
-    dy, dx = int(maxpos[0]), int(maxpos[1])
-    # wrap-around
-    if dy > H // 2:
-        dy -= H
-    if dx > W // 2:
-        dx -= W
-    return float(dx), float(dy), peak
+    img_dir = davis_root / "JPEGImages" / res / seq
+    ann_dir = davis_root / "Annotations" / res / seq
+
+    if not img_dir.exists():
+        raise FileNotFoundError(f"[DAVIS] Missing image dir: {img_dir}")
+    if not ann_dir.exists():
+        raise FileNotFoundError(f"[DAVIS] Missing annotation dir: {ann_dir}")
+
+    frames = sorted(img_dir.glob("*.jpg"))
+    if len(frames) == 0:
+        frames = sorted(img_dir.glob("*.png"))
+    if len(frames) == 0:
+        raise FileNotFoundError(f"[DAVIS] No frames in: {img_dir}")
+
+    annos: List[Path] = []
+    for fp in frames:
+        stem = fp.stem
+        cand = ann_dir / f"{stem}.png"
+        if not cand.exists():
+            cand2 = ann_dir / f"{stem}.jpg"
+            if cand2.exists():
+                cand = cand2
+        if not cand.exists():
+            raise FileNotFoundError(f"[DAVIS] Missing annotation for frame {fp.name}: tried {cand}")
+        annos.append(cand)
+
+    return frames, annos
 
 
-def stage1_precompute_split(cfg: Dict[str, Any], split_name: str, seqs: List[str], out_dir: str) -> None:
-    logger = get_logger()
-    davis_root = cfg["paths"]["davis_root"]
-    base_out = cfg["paths"]["base_out"]
+def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
+    """
+    Hash only relevant sub-config so cache invalidation is stable.
+    """
+    pick = {
+        "stage": stage,
+        "res": cfg.get("res"),
+        "stage1": cfg.get("stage1", {}),
+        "stage2": cfg.get("stage2", {}),
+        "stage3": cfg.get("stage3", {}),
+        "version": "0.2.0-lite",
+    }
+    return sha1_of_dict(pick)
+
+
+def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -> Dict[str, Any]:
+    davis_root = resolve_davis_root(cfg["davis_root"])
     res = cfg["res"]
-    feat_set = cfg["stage1"]["feat_set"]
-    pcfg = cfg["stage1"].get("phasecorr", {})
-    use_hann = bool(pcfg.get("use_hann", True))
-    eps = float(pcfg.get("eps", 1e-9))
+    seqs = _list_seq_from_split(davis_root, cfg["splits"][split])
 
-    out_abs = os.path.join(base_out, out_dir)
-    ensure_dir(out_abs)
+    out_dir = safe_mkdir(out_dir)
+    sig = _stage_signature(cfg, stage=f"stage1-{split}")
 
-    sig = signature_for_stage("stage1", cfg, extra={"split": split_name, "out_dir": out_dir})
+    s1cfg = cfg.get("stage1", {})
+    cache = bool(s1cfg.get("cache", True))
+    label_err_thresh = float(s1cfg.get("label_err_thresh", 50.0))
+    noise_cfg = dict(s1cfg.get("noise", {}))
 
     meta = {
-        "split": split_name,
+        "split": split,
         "num_seqs": len(seqs),
         "res": res,
-        "feat_set": feat_set,
+        "davis_root": str(davis_root),
         "signature": sig,
+        "label_err_thresh": label_err_thresh,
+        "noise_cfg": noise_cfg,
+        "seqs": [],
     }
-    save_json(os.path.join(out_abs, "meta.json"), meta)
 
-    pbar = tqdm(seqs, desc=f"Stage1({split_name})")
+    pbar = tqdm(seqs, desc=f"Stage1({split})")
     for seq in pbar:
-        npz_path = os.path.join(out_abs, f"{seq}.npz")
-        if is_compatible_npz(npz_path, sig):
-            logger.info(f"[skip] Stage1 exists: {seq}.npz")
+        out_npz = out_dir / f"{seq}.npz"
+        if cache and out_npz.exists():
+            # do not over-trust: but allow skip for stage1 (cheap)
+            pbar.write(f"[skip] Stage1 exists: {out_npz.name}")
+            meta["seqs"].append(seq)
             continue
 
-        img_paths, ann_paths = _davis_frame_paths(davis_root, res, seq)
-        T = len(img_paths)
+        frames, annos = davis_frame_paths(davis_root, res, seq)
 
-        z_gt = np.zeros((T, 2), dtype=np.float32)
-        mask_missing = np.zeros((T,), dtype=np.float32)
-        frames_gray = []
+        # deterministic per-seq rng
+        seed = int(cfg.get("seed", 0))
+        seed_offset = int(noise_cfg.get("seed_offset", 0))
+        rng = np.random.RandomState(seed + seed_offset + (abs(hash(seq)) % 10_000))
 
-        H = W = None
-        for t in range(T):
-            img = _load_rgb(img_paths[t])
-            m = _load_mask(ann_paths[t])
-            if H is None:
-                H, W = img.shape[0], img.shape[1]
-            x, y, miss = _centroid_from_mask(m)
-            z_gt[t] = [x if np.isfinite(x) else 0.0, y if np.isfinite(y) else 0.0]
-            mask_missing[t] = 1.0 if miss else 0.0
-            frames_gray.append(_to_gray(img))
-
-        frames_gray = np.stack(frames_gray, axis=0)  # (T,H,W)
-
-        # Propagate observed state using consecutive global shifts
-        z_obs = np.zeros((T, 2), dtype=np.float32)
-        z_obs[0] = z_gt[0]
-        peak = np.zeros((T,), dtype=np.float32)
-        cycle = np.zeros((T,), dtype=np.float32)
-
-        cum_dx = 0.0
-        cum_dy = 0.0
-        prev_dx = 0.0
-        prev_dy = 0.0
-
-        peak[0] = 1.0
-        cycle[0] = 0.0
-
-        for t in range(1, T):
-            dx, dy, pk = _phase_correlation_shift(frames_gray[t - 1], frames_gray[t], use_hann=use_hann, eps=eps)
-            # backward consistency
-            bdx, bdy, _ = _phase_correlation_shift(frames_gray[t], frames_gray[t - 1], use_hann=use_hann, eps=eps)
-            cyc = np.sqrt((dx + bdx) ** 2 + (dy + bdy) ** 2)
-
-            cum_dx += dx
-            cum_dy += dy
-            z_obs[t] = z_obs[t - 1] + np.array([dx, dy], dtype=np.float32)
-
-            peak[t] = float(pk)
-            cycle[t] = float(cyc)
-
-            prev_dx, prev_dy = dx, dy
-
-        # out_of_frame flag
-        out_of_frame = np.zeros((T,), dtype=np.float32)
-        out_of_frame[(z_obs[:, 0] < 0) | (z_obs[:, 0] >= W) | (z_obs[:, 1] < 0) | (z_obs[:, 1] >= H)] = 1.0
-
-        # motion stats
-        speed = np.zeros((T,), dtype=np.float32)
-        accel = np.zeros((T,), dtype=np.float32)
-        for t in range(1, T):
-            d = z_obs[t] - z_obs[t - 1]
-            speed[t] = float(np.sqrt((d ** 2).sum()))
-        for t in range(2, T):
-            dd = z_obs[t] - 2 * z_obs[t - 1] + z_obs[t - 2]
-            accel[t] = float(np.sqrt((dd ** 2).sum()))
-
-        # normalize peak into [0,1] (robust)
-        pk = peak.copy()
-        pk = np.clip(pk, 0.0, np.quantile(pk, 0.99) + 1e-6)
-        pk = pk / (pk.max() + 1e-6)
-
-        E, feat_names = build_features(
-            feat_set=feat_set,
-            peak=pk,
-            cycle=cycle,
-            out_of_frame=out_of_frame,
-            mask_missing=mask_missing,
-            speed=speed,
-            accel=accel,
-        )
-
-        # Observed error (proxy task): how far z_obs from z_gt
-        err_obs = np.sqrt(((z_obs - z_gt) ** 2).sum(axis=1)).astype(np.float32)
-
-        save_npz_atomic(
-            npz_path,
-            signature=sig,
+        ev = build_sequence_evidence(
             seq=seq,
-            res=res,
-            H=int(H),
-            W=int(W),
-            T=int(T),
-            z_gt=z_gt,
-            z_obs=z_obs,
-            err_obs=err_obs,
-            E=E.astype(np.float32),
-            feat_names=np.array(feat_names, dtype=object),
-            peak=pk.astype(np.float32),
-            cycle=cycle.astype(np.float32),
-            out_of_frame=out_of_frame.astype(np.float32),
-            mask_missing=mask_missing.astype(np.float32),
-            speed=speed.astype(np.float32),
-            accel=accel.astype(np.float32),
+            frame_paths=frames,
+            anno_paths=annos,
+            label_err_thresh=label_err_thresh,
+            noise_cfg=noise_cfg,
+            rng=rng,
         )
 
-    logger.info(f"[OK] Stage1({split_name}) meta: {os.path.join(out_abs,'meta.json')}")
-    logger.info(f"[OK] Stage1({split_name}) npz_dir: {out_abs}  num_npz={len(seqs)}")
+        arrays = {
+            "z_gt": ev.z_gt.astype(np.float32),
+            "has_gt": ev.has_gt.astype(np.uint8),
+            "z_obs": ev.z_obs.astype(np.float32),
+            "err_obs": ev.err_obs.astype(np.float32),
+            "y": ev.y.astype(np.uint8),
 
+            "iou_shift": ev.iou_shift.astype(np.float32),
+            "cycle_err": ev.cycle_err.astype(np.float32),
+            "area_change": ev.area_change.astype(np.float32),
+            "occl_flag": ev.occl_flag.astype(np.uint8),
+            "blur_flag": ev.blur_flag.astype(np.uint8),
+            "blur_inv": ev.blur_inv.astype(np.float32),
+            "motion": ev.motion.astype(np.float32),
 
-def stage2_build(cfg: Dict[str, Any], train_seqs: List[str], val_seqs: List[str]) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Stage2 writes per-seq npz with labels y and stores a train-derived label threshold in meta.
-    Returns (train_dir, val_dir, meta)
-    """
-    logger = get_logger()
-    base_out = cfg["paths"]["base_out"]
-
-    s1_train = os.path.join(base_out, cfg["stage1"]["out_train"])
-    s1_val = os.path.join(base_out, cfg["stage1"]["out_val"])
-    s2_train = os.path.join(base_out, cfg["stage2"]["out_train"])
-    s2_val = os.path.join(base_out, cfg["stage2"]["out_val"])
-    ensure_dir(s2_train)
-    ensure_dir(s2_val)
-
-    sig_train = signature_for_stage("stage2", cfg, extra={"split": "train"})
-    sig_val = signature_for_stage("stage2", cfg, extra={"split": "val"})
-
-    label_cfg = cfg["stage2"]["label"]
-    mode = str(label_cfg.get("mode", "quantile")).lower()
-    q_pos = float(label_cfg.get("q_pos", 0.455))
-    fixed_thr = float(label_cfg.get("fixed_err_thresh", 30.0))
-
-    # Determine threshold from train distribution
-    train_errs = []
-    for seq in train_seqs:
-        z = load_npz(os.path.join(s1_train, f"{seq}.npz"))
-        train_errs.append(z["err_obs"].astype(np.float64))
-    all_train_err = np.concatenate(train_errs, axis=0) if train_errs else np.array([], dtype=np.float64)
-
-    if all_train_err.size == 0:
-        raise RuntimeError("Stage2: empty train_errs; check DAVIS paths and Stage1 outputs.")
-
-    if mode == "fixed":
-        err_thr = fixed_thr
-    elif mode == "quantile":
-        # positive = "usable" = small error; choose threshold such that pos_rate ~= q_pos
-        err_thr = float(np.quantile(all_train_err, q_pos))
-    else:
-        raise ValueError(f"Unknown label.mode={mode}. Use fixed|quantile.")
-
-    meta = {
-        "label_mode": mode,
-        "q_pos": q_pos,
-        "fixed_err_thresh": fixed_thr,
-        "err_thresh": float(err_thr),
-        "train_sig": sig_train,
-        "val_sig": sig_val,
-    }
-
-    # Write train per-seq
-    logger.info(f"[Stage2:train] stage1_dir={s1_train} num_seq={len(train_seqs)}")
-    for seq in tqdm(train_seqs, desc="Stage2(train)"):
-        in_npz = os.path.join(s1_train, f"{seq}.npz")
-        out_npz = os.path.join(s2_train, f"{seq}.npz")
-        if is_compatible_npz(out_npz, sig_train):
-            logger.info(f"[skip] Stage2 exists (compatible): {seq}.npz")
-            continue
-        z = load_npz(in_npz)
-        E = z["E"].astype(np.float32)
-        err_obs = z["err_obs"].astype(np.float32)
-        y = (err_obs <= err_thr).astype(np.int64)
-        save_npz_atomic(
-            out_npz,
-            signature=sig_train,
-            seq=seq,
-            E=E,
-            y=y,
-            err_obs=err_obs,
-            z_gt=z["z_gt"].astype(np.float32),
-            z_obs=z["z_obs"].astype(np.float32),
-            feat_names=z["feat_names"],
-        )
-
-    # Write val per-seq (use same err_thr)
-    logger.info(f"[Stage2:val] stage1_dir={s1_val} num_seq={len(val_seqs)}")
-    for seq in tqdm(val_seqs, desc="Stage2(val)"):
-        in_npz = os.path.join(s1_val, f"{seq}.npz")
-        out_npz = os.path.join(s2_val, f"{seq}.npz")
-        if is_compatible_npz(out_npz, sig_val):
-            logger.info(f"[skip] Stage2 exists (compatible): {seq}.npz")
-            continue
-        z = load_npz(in_npz)
-        E = z["E"].astype(np.float32)
-        err_obs = z["err_obs"].astype(np.float32)
-        y = (err_obs <= err_thr).astype(np.int64)
-        save_npz_atomic(
-            out_npz,
-            signature=sig_val,
-            seq=seq,
-            E=E,
-            y=y,
-            err_obs=err_obs,
-            z_gt=z["z_gt"].astype(np.float32),
-            z_obs=z["z_obs"].astype(np.float32),
-            feat_names=z["feat_names"],
-        )
-
-    save_json(os.path.join(s2_train, "meta.json"), meta)
-    logger.info(f"[OK] Stage2 done: train_npz={len(train_seqs)} val_npz={len(val_seqs)}")
-    return s2_train, s2_val, meta
-
-
-def _load_stage2_split(stage2_dir: str, seqs: List[str]) -> Dict[str, Dict[str, Any]]:
-    data = {}
-    for seq in seqs:
-        data[seq] = load_npz(os.path.join(stage2_dir, f"{seq}.npz"))
-    return data
-
-
-def stage3_run(cfg: Dict[str, Any], train_seqs: List[str], val_seqs: List[str]) -> None:
-    logger = get_logger()
-    base_out = cfg["paths"]["base_out"]
-
-    s2_train = os.path.join(base_out, cfg["stage2"]["out_train"])
-    s2_val = os.path.join(base_out, cfg["stage2"]["out_val"])
-    meta2 = None
-    try:
-        import json
-        with open(os.path.join(s2_train, "meta.json"), "r", encoding="utf-8") as f:
-            meta2 = json.load(f)
-    except Exception:
-        meta2 = {}
-
-    out_dir = os.path.join(base_out, cfg["stage3"]["out_dir"])
-    ensure_dir(out_dir)
-
-    # Load per-seq stage2 data
-    tr = _load_stage2_split(s2_train, train_seqs)
-    va = _load_stage2_split(s2_val, val_seqs)
-
-    logger.info(f"[Stage3] train seq: {len(tr)} val seq: {len(va)}")
-
-    # Build frame-level datasets
-    X_tr = np.concatenate([tr[s]["E"] for s in train_seqs], axis=0)
-    y_tr = np.concatenate([tr[s]["y"] for s in train_seqs], axis=0)
-
-    X_va = np.concatenate([va[s]["E"] for s in val_seqs], axis=0)
-    y_va = np.concatenate([va[s]["y"] for s in val_seqs], axis=0)
-
-    logger.info(f"[Data] X_tr {X_tr.shape} pos_rate {float(y_tr.mean())}")
-    logger.info(f"[Data] X_va {X_va.shape} pos_rate {float(y_va.mean())}")
-
-    # Keep dims (drop all-zero columns if any)
-    keep = np.any(np.abs(X_tr) > 1e-12, axis=0)
-    X_tr2 = X_tr[:, keep]
-    X_va2 = X_va[:, keep]
-    logger.info(f"[Feat] keep dims: {keep} num_keep: {int(keep.sum())}")
-
-    # Fit emission
-    em_cfg = cfg["stage3"]["emission"]
-    model = fit_emission(X_tr2, y_tr, em_cfg)
-
-    p_tr = model.predict_proba(X_tr2)
-    p_va = model.predict_proba(X_va2)
-
-    # Emission metrics on val (frame-level)
-    m = compute_emission_metrics(p_va, y_va, bins=int(cfg["stage3"]["analysis"].get("bins", 10)))
-    logger.info(f"[Emission] AUROC={m['AUROC']:.4f}  ECE={m['ECE']:.4f}  risk@50%={m['risk@50%']:.4f}")
-
-    # HMM params
-    A, pi = build_hmm_params(cfg["stage3"]["hmm"])
-
-    # Per-seq smoothed posterior
-    w_tr_seqs = {}
-    w_va_seqs = {}
-
-    def smooth_split(split: Dict[str, Dict[str, Any]], seqs: List[str], keep_mask: np.ndarray) -> Dict[str, np.ndarray]:
-        out = {}
-        for s in seqs:
-            E = split[s]["E"][:, keep_mask].astype(np.float64)
-            p = model.predict_proba(E)
-            w = hmm_smooth_binary(p, A=A, pi=pi)
-            out[s] = w.astype(np.float64)
-        return out
-
-    w_tr_seqs = smooth_split(tr, train_seqs, keep)
-    w_va_seqs = smooth_split(va, val_seqs, keep)
-
-    # Choose tau by train global quantile
-    tau_cfg = cfg["stage3"]["tau"]
-    mode = str(tau_cfg.get("mode", "global_quantile")).lower()
-    target_frac = float(tau_cfg.get("target_frac", 0.25))
-
-    all_w_tr = np.concatenate([w_tr_seqs[s] for s in train_seqs], axis=0)
-    if mode == "global_quantile":
-        tau = float(np.quantile(all_w_tr, target_frac))
-    else:
-        raise ValueError(f"Unknown tau.mode={mode}")
-
-    logger.info(f"[Tau] global_quantile from train: tau_global={tau:.6f} (target_frac={target_frac})")
-
-    # AoB + eval
-    fail_thr = float(cfg["stage3"]["eval"].get("fail_err_thresh", 50.0))
-    aob_cfg = cfg["stage3"]["aob"]
-    # If eps_gate>=1.0, enforce pure abstain (bridge disabled)
-    if float(aob_cfg.get("eps_gate", 1.0)) >= 1.0:
-        aob_cfg = dict(aob_cfg)
-        bridge = dict(aob_cfg.get("bridge") or {})
-        bridge["enabled"] = False
-        aob_cfg["bridge"] = bridge
-
-    rows = []
-    w_all_val = []
-    err_all_val = []
-    probs_all_val = []
-    y_all_val = []
-
-    # For feat stats on train
-    feat_stats = {}
-    Xtr_kept = X_tr[:, keep]
-    for d in range(Xtr_kept.shape[1]):
-        col = Xtr_kept[:, d].astype(np.float64)
-        feat_stats[f"dim{d}"] = {
-            "mean": float(np.mean(col)),
-            "std": float(np.std(col)),
-            "q1": float(np.quantile(col, 0.25)),
-            "q3": float(np.quantile(col, 0.75)),
-            "iqr": float(np.quantile(col, 0.75) - np.quantile(col, 0.25)),
-            "min": float(np.min(col)),
-            "max": float(np.max(col)),
-            "frac_zero": float(np.mean(col == 0.0)),
+            "img_hw": np.array([ev.img_h, ev.img_w], dtype=np.int32),
         }
+        meta_local = {
+            "seq": seq,
+            "T": len(frames),
+            "signature": sig,
+            "frames_rel0": str(Path(frames[0]).name),
+            "img_h": ev.img_h,
+            "img_w": ev.img_w,
+        }
+        npz_write(out_npz, arrays=arrays, meta=meta_local)
+        meta["seqs"].append(seq)
 
-    for seq in tqdm(val_seqs, desc="Stage3(val)"):
-        dat = va[seq]
-        w = w_va_seqs[seq]
-        z_gt = dat["z_gt"].astype(np.float64)
-        z_obs = dat["z_obs"].astype(np.float64)
-        err_obs = dat["err_obs"].astype(np.float64)
+    write_json(out_dir / "meta.json", meta)
+    return meta
 
-        # Build z_bar (proxy) as z_obs; AoB operates on z_bar to "fix" unreliable segments
-        z_bar = z_obs.copy()
 
-        z_fin, stats = apply_aob(w=w, z_bar=z_bar, tau=tau, cfg_aob=aob_cfg)
-        z_fin = z_fin.astype(np.float64)
-        err_fin = np.sqrt(((z_fin - z_gt) ** 2).sum(axis=1)).astype(np.float64)
+def stage2_build_features_for_seq(arr: Dict[str, np.ndarray], *, feat_mode: str) -> np.ndarray:
+    """
+    Build per-frame features X.
+    Mode 'a' => 5 dims:
+      [iou_shift, cycle_err_norm, area_change, occl_flag, blur_flag]
+    Mode 'b' => 7 dims adds:
+      [blur_inv, motion_norm]
+    """
+    iou_shift = arr["iou_shift"].astype(np.float32)
+    cycle_err = arr["cycle_err"].astype(np.float32)
+    area_change = arr["area_change"].astype(np.float32)
+    occl = arr["occl_flag"].astype(np.float32)
+    blur = arr["blur_flag"].astype(np.float32)
+    blur_inv = arr["blur_inv"].astype(np.float32)
+    motion = arr["motion"].astype(np.float32)
 
-        low_mask = (w < tau)
-        # bridged/abstained masks from decisions
-        bridged_mask = np.zeros_like(low_mask, dtype=bool)
-        abstained_mask = np.zeros_like(low_mask, dtype=bool)
-        for seg in stats["segments"]:
-            s0, e0 = int(seg["start"]), int(seg["end"])
-            if seg["kind"] == "bridge":
-                bridged_mask[s0:e0 + 1] = True
+    hw = arr["img_hw"].astype(np.float32)
+    h, w = float(hw[0]), float(hw[1])
+    diag = float(math.sqrt(h * h + w * w) + 1e-6)
+
+    cycle_norm = cycle_err / diag
+    motion_norm = motion / 10.0  # scale to ~[0..30] on fast motion
+
+    if feat_mode.lower() == "a":
+        X = np.stack([iou_shift, cycle_norm, area_change, occl, blur], axis=1)
+    elif feat_mode.lower() == "b":
+        X = np.stack([iou_shift, cycle_norm, area_change, occl, blur, blur_inv, motion_norm], axis=1)
+    else:
+        raise ValueError(f"Unknown feat_mode={feat_mode}. Use 'a' or 'b'.")
+    return X.astype(np.float32)
+
+
+def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, out_dir: Path) -> Dict[str, Any]:
+    stage1_dir = Path(stage1_dir)
+    out_dir = safe_mkdir(out_dir)
+
+    s2cfg = cfg.get("stage2", {})
+    cache = bool(s2cfg.get("cache", True))
+    feat_mode = str(s2cfg.get("feat_mode", "b")).lower()
+
+    sig = _stage_signature(cfg, stage=f"stage2-{split}-feat{feat_mode}")
+
+    # read meta to get seqs (fallback: list npz)
+    meta_path = stage1_dir / "meta.json"
+    if meta_path.exists():
+        meta = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
+        seqs = list(meta.get("seqs", []))
+    else:
+        seqs = sorted([p.stem for p in stage1_dir.glob("*.npz") if p.name != "meta.npz"])
+
+    pbar = tqdm(seqs, desc=f"Stage2({split})")
+    for seq in pbar:
+        in_npz = stage1_dir / f"{seq}.npz"
+        out_npz = out_dir / f"{seq}.npz"
+        if not in_npz.exists():
+            raise FileNotFoundError(f"[Stage2] Missing Stage1 npz: {in_npz}")
+
+        if cache and out_npz.exists():
+            _, m = npz_read(out_npz)
+            if m.get("signature", "") == sig and m.get("feat_mode", "") == feat_mode:
+                pbar.write(f"[skip] Stage2 exists (compatible): {out_npz.name}")
+                continue
             else:
-                abstained_mask[s0:e0 + 1] = True
+                pbar.write(f"[recompute] Stage2 stale/mismatch -> {out_npz.name}")
 
-        row = per_seq_summary(
-            seq=seq,
-            tau=tau,
-            w=w,
-            err_obs=err_obs,
-            err_fin=err_fin,
-            low_mask=low_mask,
-            bridged_mask=bridged_mask,
-            abstained_mask=abstained_mask,
-            fail_thr=fail_thr,
-        )
-        rows.append(row)
+        arr, m1 = npz_read(in_npz)
+        X = stage2_build_features_for_seq(arr, feat_mode=feat_mode)
+        y = arr["y"].astype(np.uint8)
+        err_obs = arr["err_obs"].astype(np.float32)
 
-        # Collect for global analysis
-        w_all_val.append(w)
-        err_all_val.append(err_obs)
+        arrays = {
+            "X": X,
+            "y": y,
+            "err_obs": err_obs,
+            "z_gt": arr["z_gt"].astype(np.float32),
+            "z_obs": arr["z_obs"].astype(np.float32),
+            "img_hw": arr["img_hw"].astype(np.int32),
+        }
+        meta2 = {
+            "seq": seq,
+            "T": int(X.shape[0]),
+            "feat_mode": feat_mode,
+            "signature": sig,
+        }
+        npz_write(out_npz, arrays=arrays, meta=meta2)
 
-        # emission probs for this seq (calibrated)
-        E = dat["E"][:, keep].astype(np.float64)
-        p = model.predict_proba(E)
-        probs_all_val.append(p)
-        y_all_val.append(dat["y"].astype(np.int64))
+    out_meta = {"split": split, "signature": sig, "feat_mode": feat_mode, "num_seqs": len(seqs)}
+    return out_meta
 
-    table = pd.DataFrame(rows)
-    w_all_val = np.concatenate(w_all_val, axis=0) if w_all_val else np.array([], dtype=np.float64)
-    err_all_val = np.concatenate(err_all_val, axis=0) if err_all_val else np.array([], dtype=np.float64)
-    probs_all_val = np.concatenate(probs_all_val, axis=0) if probs_all_val else np.array([], dtype=np.float64)
-    y_all_val = np.concatenate(y_all_val, axis=0) if y_all_val else np.array([], dtype=np.int64)
 
-    # Aggregates (match your log style)
-    logger.info("\n[Val aggregate]")
-    logger.info(f"mean obs_p95 {float(table['all_obs_p95'].mean())} mean fin_p95 {float(table['all_fin_p95'].mean())}")
-    logger.info(f"mean obs_fail {float(table['all_obs_fail'].mean())} mean fin_fail {float(table['all_fin_fail'].mean())}")
-    logger.info(f"mean low_frac {float(table['low_frac'].mean())} mean bridged_frames {float(table['bridge_n'].mean())}")
+def _concat_stage2(npz_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    Xs, ys, errs = [], [], []
+    for p in sorted(npz_dir.glob("*.npz")):
+        if p.name == "meta.json":
+            continue
+        arr, _ = npz_read(p)
+        Xs.append(arr["X"])
+        ys.append(arr["y"])
+        errs.append(arr["err_obs"])
+    X = np.concatenate(Xs, axis=0) if Xs else np.zeros((0, 1), dtype=np.float32)
+    y = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
+    err = np.concatenate(errs, axis=0) if errs else np.zeros((0,), dtype=np.float32)
+    return X, y, err
 
-    # Write analysis outputs
-    write_analysis(
-        out_dir=out_dir,
-        table=table,
-        w_all=w_all_val,
-        err_all=err_all_val,
-        y_all=y_all_val,
-        probs_all=probs_all_val,
-        tau=tau,
-        feat_stats=feat_stats,
-        cfg_analysis=cfg["stage3"]["analysis"],
+
+def _feature_keep_mask(X: np.ndarray) -> np.ndarray:
+    # drop constant dims
+    std = X.std(axis=0)
+    keep = std > 1e-12
+    return keep
+
+
+def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Path, out_dir: Path) -> None:
+    out_dir = safe_mkdir(out_dir)
+    analysis_dir = safe_mkdir(out_dir / "_analysis")
+
+    s3 = cfg.get("stage3", {})
+    hmm_cfg = s3.get("hmm", {})
+    em_cfg = s3.get("emission", {})
+    aob_cfg = s3.get("aob", {})
+    met_cfg = s3.get("metrics", {})
+    ana_cfg = s3.get("analysis", {})
+
+    tau_mode = str(s3.get("tau_mode", "global"))
+    target_frac = float(s3.get("tau_target_frac", 0.25))
+    tau_min = float(s3.get("tau_min", 1e-6))
+    tau_max = float(s3.get("tau_max", 0.999999))
+
+    hmm = HMMParams(
+        prior_good=float(hmm_cfg.get("prior_good", 0.85)),
+        p_stay_good=float(hmm_cfg.get("p_stay_good", 0.92)),
+        p_stay_bad=float(hmm_cfg.get("p_stay_bad", 0.92)),
+        eps=float(hmm_cfg.get("eps", 1e-12)),
+    )
+    fail_px = float(met_cfg.get("fail_px", 50.0))
+
+    aobp = AoBParams(
+        eps_gate=float(aob_cfg.get("eps_gate", 0.5)),
+        abstain_mode=str(aob_cfg.get("abstain_mode", "hold")).lower(),
+        eta_L=float(aob_cfg.get("eta_L", 0.18)),
+        eta_u=float(aob_cfg.get("eta_u", 0.65)),
+        max_bridge_len=int(aob_cfg.get("max_bridge_len", 20)),
     )
 
-    logger.info(f"[OK] wrote stage3 to: {out_dir}")
+    # train emission
+    X_tr, y_tr, err_tr = _concat_stage2(stage2_train)
+    X_va, y_va, err_va = _concat_stage2(stage2_val)
+
+    print(f"[Data] X_tr {tuple(X_tr.shape)} pos_rate {float(y_tr.mean()) if y_tr.size else float('nan')}")
+    print(f"[Data] X_va {tuple(X_va.shape)} pos_rate {float(y_va.mean()) if y_va.size else float('nan')}")
+
+    keep = _feature_keep_mask(X_tr)
+    X_tr_k = X_tr[:, keep]
+    X_va_k = X_va[:, keep]
+    print(f"[Feat] keep dims: {keep} num_keep: {int(keep.sum())}")
+
+    clf = fit_emission_model(X_tr_k, y_tr, c=float(em_cfg.get("c", 1.0)), max_iter=int(em_cfg.get("max_iter", 2000)))
+
+    p_tr = clf.predict_proba(X_tr_k)[:, 1].astype(np.float32)
+    p_va = clf.predict_proba(X_va_k)[:, 1].astype(np.float32)
+    m = emission_metrics(p_va, y_va)
+    print(f"[Emission] AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  risk@50%={m['risk@50%']:.4f}")
+
+    # For tau_global we want threshold such that fraction(w<tau)=target_frac
+    # => tau = quantile(w, target_frac). But w here should be smoothed per sequence.
+    # We'll compute w_train by running HMM per seq and concatenating.
+
+    def _seq_post_w(npz_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        arr, _ = npz_read(npz_path)
+        X = arr["X"][:, keep].astype(np.float32)
+        p = clf.predict_proba(X)[:, 1].astype(np.float32)
+        w = forward_backward_binary(p, hmm)
+        return w, p
+
+    # compute global tau if needed
+    tau_global = None
+    if tau_mode.lower() == "global":
+        ws = []
+        for p in sorted(stage2_train.glob("*.npz")):
+            w, _ = _seq_post_w(p)
+            ws.append(w)
+        w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
+        if w_all.size == 0:
+            tau_global = 0.5
+        else:
+            tau_global = float(np.quantile(w_all, target_frac))
+            tau_global = clamp(tau_global, tau_min, tau_max)
+        print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
+
+    # eval on val seq-wise
+    rows = []
+    all_w_val = []
+    all_err_obs_val = []
+
+    pbar = tqdm(sorted(stage2_val.glob("*.npz")), desc="Stage3(val)")
+    for npz_path in pbar:
+        arr, meta = npz_read(npz_path)
+        seq = meta.get("seq", npz_path.stem)
+
+        X = arr["X"][:, keep].astype(np.float32)
+        z_gt = arr["z_gt"].astype(np.float32)
+        z_obs = arr["z_obs"].astype(np.float32)
+        p = clf.predict_proba(X)[:, 1].astype(np.float32)
+        w = forward_backward_binary(p, hmm)
+
+        if tau_mode.lower() == "global":
+            tau = float(tau_global)
+        elif tau_mode.lower() == "per_video":
+            tau = float(np.quantile(w, target_frac)) if w.size else 0.5
+            tau = clamp(tau, tau_min, tau_max)
+        else:
+            raise ValueError(f"Unknown tau_mode={tau_mode}. Use global|per_video.")
+
+        z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=w, tau=tau, params=aobp)
+
+        sm = compute_seq_metrics(
+            seq=seq,
+            z_gt=z_gt,
+            z_obs=z_obs,
+            z_fin=z_fin,
+            w=w,
+            tau=tau,
+            is_bridge=is_bridge,
+            is_abst=is_abst,
+            fail_px=fail_px,
+        )
+        rows.append(metrics_to_row(sm))
+
+        all_w_val.append(w)
+        all_err_obs_val.append(arr["err_obs"].astype(np.float32))
+
+    df = pd.DataFrame(rows)
+    if len(df) > 0:
+        print("\n[Val aggregate]")
+        print("mean obs_p95", float(df["all_obs_p95"].mean()), "mean fin_p95", float(df["all_fin_p95"].mean()))
+        print("mean obs_fail", float(df["all_obs_fail"].mean()), "mean fin_fail", float(df["all_fin_fail"].mean()))
+        print("mean low_frac", float(df["low_frac"].mean()), "mean bridged_frames", float(df["bridge_n"].mean()))
+    else:
+        print("[Val aggregate] empty")
+
+    # write analysis
+    if bool(ana_cfg.get("write_csv", True)):
+        csv_path = analysis_dir / "table_v1.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"[OK] wrote: {csv_path}")
+
+    # correlation spearman(w, -err)
+    try:
+        from scipy.stats import spearmanr
+        wcat = np.concatenate(all_w_val, axis=0) if all_w_val else np.zeros((0,), dtype=np.float32)
+        ecat = np.concatenate(all_err_obs_val, axis=0) if all_err_obs_val else np.zeros((0,), dtype=np.float32)
+        if wcat.size > 10 and ecat.size == wcat.size:
+            rho = float(spearmanr(wcat, -ecat).correlation)
+        else:
+            rho = float("nan")
+    except Exception:
+        rho = float("nan")
+
+    (analysis_dir / "corr_wtil_err.txt").write_text(f"spearman(wtil, -err_obs) = {rho}\n", encoding="utf-8")
+    print(f"[OK] wrote stage3 to: {out_dir}")
+    print(f"  spearman(wtil, -err_obs) = {rho}")
+
+    # figs
+    if bool(ana_cfg.get("write_figs", True)) and len(df) > 0:
+        # gate bins: reliability vs empirical accuracy
+        wcat = np.concatenate(all_w_val, axis=0) if all_w_val else np.zeros((0,), dtype=np.float32)
+        # need y_val too -> approximate by concatenating from val dir
+        ys = []
+        for p in sorted(stage2_val.glob("*.npz")):
+            arr, _ = npz_read(p)
+            ys.append(arr["y"].astype(np.float32))
+        ycat = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.float32)
+
+        if wcat.size == ycat.size and wcat.size > 0:
+            bins = np.linspace(0.0, 1.0, 11)
+            xs, accs = [], []
+            for i in range(10):
+                lo, hi = bins[i], bins[i + 1]
+                m = (wcat >= lo) & (wcat < hi) if i < 9 else (wcat >= lo) & (wcat <= hi)
+                if m.sum() == 0:
+                    continue
+                xs.append(0.5 * (lo + hi))
+                accs.append(float(ycat[m].mean()))
+            plt.figure()
+            plt.plot(xs, accs, marker="o")
+            plt.xlabel("wtil bin center")
+            plt.ylabel("empirical P(y=1)")
+            plt.title("Gate bins (reliability semantics)")
+            plt.tight_layout()
+            fig1 = analysis_dir / "fig_gate_bins.png"
+            plt.savefig(fig1, dpi=160)
+            plt.close()
+
+        # tau hist (if per_video)
+        plt.figure()
+        plt.hist(df["tau"].values, bins=20)
+        plt.xlabel("tau")
+        plt.ylabel("count")
+        plt.title("Tau distribution")
+        plt.tight_layout()
+        fig2 = analysis_dir / "fig_tau_hist.png"
+        plt.savefig(fig2, dpi=160)
+        plt.close()
+
+        # low_frac hist
+        plt.figure()
+        plt.hist(df["low_frac"].values, bins=20)
+        plt.xlabel("low_frac")
+        plt.ylabel("count")
+        plt.title("Low fraction distribution")
+        plt.tight_layout()
+        fig3 = analysis_dir / "fig_lowfrac_hist.png"
+        plt.savefig(fig3, dpi=160)
+        plt.close()
+
+        # feature histogram
+        plt.figure()
+        for j in range(X_tr.shape[1]):
+            plt.hist(X_tr[:, j], bins=30, alpha=0.5, label=f"dim{j}")
+        plt.legend()
+        plt.title("Feature hist (train)")
+        plt.tight_layout()
+        fig4 = analysis_dir / "fig_feat_hist.png"
+        plt.savefig(fig4, dpi=160)
+        plt.close()
+
+        print(f"[OK] wrote: {analysis_dir}/fig_gate_bins.png")
+        print(f"[OK] wrote: {analysis_dir}/fig_tau_hist.png {analysis_dir}/fig_lowfrac_hist.png")
+        print(f"[OK] wrote: {analysis_dir}/fig_feat_hist.png")
 
 
 def run_all(cfg: Dict[str, Any]) -> None:
-    logger = get_logger()
-
-    davis_root = cfg["paths"]["davis_root"]
-    base_out = cfg["paths"]["base_out"]
+    davis_root = resolve_davis_root(cfg["davis_root"])
+    base_out = Path(cfg["base_out"])
     res = cfg["res"]
 
-    print("\n========== PR2-Drag Lite ==========")
-    print(f"cmd       : run_all")
-    print(f"config    : (loaded yaml)")
-    print(f"davis_root : {davis_root}")
-    print(f"res       : {res}")
-    print(f"base_out  : {base_out}")
-    print("===================================\n")
+    out_train_s1 = base_out / "davis2016_train_precompute"
+    out_val_s1 = base_out / "davis2016_val_precompute"
 
-    train_seqs = read_split_list(davis_root, cfg["splits"]["train"])
-    val_seqs = read_split_list(davis_root, cfg["splits"]["val"])
+    out_train_s2 = base_out / "davis2016_stage2_fixed"
+    out_val_s2 = base_out / "davis2016_val_stage2"
 
-    # Stage1
-    stage1_precompute_split(cfg, "train", train_seqs, cfg["stage1"]["out_train"])
-    stage1_precompute_split(cfg, "val", val_seqs, cfg["stage1"]["out_val"])
+    out_dir_s3 = base_out / cfg.get("stage3", {}).get("out_dir", "davis2016_stage3_fixed")
 
-    # Stage2
-    stage2_build(cfg, train_seqs, val_seqs)
+    print(pretty_header("PR2-Drag Lite", {
+        "cmd": "run_all",
+        "davis_root": str(davis_root),
+        "res": res,
+        "base_out": str(base_out),
+    }))
 
-    # Stage3
-    stage3_run(cfg, train_seqs, val_seqs)
+    meta_tr = stage1_precompute_split(cfg, split="train", out_dir=out_train_s1)
+    print(f"[OK] Stage1(train) meta: {out_train_s1/'meta.json'}")
+    print(f"[OK] Stage1(train) npz_dir: {out_train_s1}  num_npz={len(meta_tr.get('seqs', []))}")
+
+    meta_va = stage1_precompute_split(cfg, split="val", out_dir=out_val_s1)
+    print(f"[OK] Stage1(val) meta: {out_val_s1/'meta.json'}")
+    print(f"[OK] Stage1(val) npz_dir: {out_val_s1}  num_npz={len(meta_va.get('seqs', []))}")
+
+    stage2_compute_split(cfg, split="train", stage1_dir=out_train_s1, out_dir=out_train_s2)
+    stage2_compute_split(cfg, split="val", stage1_dir=out_val_s1, out_dir=out_val_s2)
+    print(f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} val_npz= {len(list(out_val_s2.glob('*.npz')))}")
+
+    stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)

@@ -1,129 +1,115 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import roc_auc_score
+
+
+def ece_score(p: np.ndarray, y: np.ndarray, n_bins: int = 15) -> float:
+    p = np.asarray(p).astype(np.float64)
+    y = np.asarray(y).astype(np.float64)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        m = (p >= lo) & (p < hi) if i < n_bins - 1 else (p >= lo) & (p <= hi)
+        if m.sum() == 0:
+            continue
+        acc = y[m].mean()
+        conf = p[m].mean()
+        ece += (m.sum() / len(p)) * abs(acc - conf)
+    return float(ece)
+
+
+def risk_at_coverage(p: np.ndarray, y: np.ndarray, coverage: float = 0.5) -> float:
+    """
+    Keep top coverage by confidence p, compute risk = 1-accuracy on kept subset.
+    """
+    p = np.asarray(p).astype(np.float64)
+    y = np.asarray(y).astype(np.int64)
+    n = len(p)
+    k = int(round(n * coverage))
+    k = max(1, min(n, k))
+    idx = np.argsort(-p)[:k]
+    acc = (y[idx] == 1).mean()
+    return float(1.0 - acc)
 
 
 @dataclass
-class EmissionModel:
-    clf: LogisticRegression
-    calibrator: Optional[IsotonicRegression] = None
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        p = self.clf.predict_proba(X)[:, 1].astype(np.float64)
-        p = np.clip(p, 1e-6, 1.0 - 1e-6)
-        if self.calibrator is not None:
-            p = self.calibrator.transform(p)
-            p = np.clip(p, 1e-6, 1.0 - 1e-6)
-        return p
+class HMMParams:
+    prior_good: float
+    p_stay_good: float
+    p_stay_bad: float
+    eps: float = 1e-12
 
 
-def fit_emission(
-    X: np.ndarray,
-    y: np.ndarray,
-    cfg_emission: Dict[str, Any],
-) -> EmissionModel:
-    model = str(cfg_emission.get("model", "logreg")).lower()
-    if model != "logreg":
-        raise ValueError(f"Unsupported emission model: {model}")
-
-    C = float(cfg_emission.get("C", 1.0))
-    max_iter = int(cfg_emission.get("max_iter", 2000))
-    class_weight = cfg_emission.get("class_weight", "balanced")
-
-    clf = LogisticRegression(
-        C=C,
-        max_iter=max_iter,
-        class_weight=class_weight,
-        solver="lbfgs",
-    )
-    clf.fit(X, y)
-
-    calib_cfg = (cfg_emission.get("calibrate") or {})
-    enabled = bool(calib_cfg.get("enabled", False))
-    method = str(calib_cfg.get("method", "isotonic")).lower()
-
-    calibrator = None
-    if enabled:
-        if method == "isotonic":
-            # Calibrate on train predictions (simple, auditable)
-            p_train = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1.0 - 1e-6)
-            calibrator = IsotonicRegression(out_of_bounds="clip")
-            calibrator.fit(p_train, y.astype(np.float64))
-        elif method in ("none", "off"):
-            calibrator = None
-        else:
-            raise ValueError(f"Unknown calibration method: {method}")
-
-    return EmissionModel(clf=clf, calibrator=calibrator)
-
-
-def hmm_smooth_binary(
-    p1: np.ndarray,
-    A: np.ndarray,
-    pi: np.ndarray,
-) -> np.ndarray:
+def forward_backward_binary(emission_p_good: np.ndarray, hmm: HMMParams) -> np.ndarray:
     """
-    Forward-backward for 2-state HMM where emission likelihood is:
-      e_t = [P(obs | chi=0), P(obs | chi=1)] ~ [1-p1[t], p1[t]]
-    Returns posterior gamma_t = P(chi=1 | obs_1:T)
-    Uses scaling for numerical stability.
+    Two-state HMM with states {bad=0, good=1}
+    emission_p_good[t] = p(x_t | state=good) proportional to p_good (we treat as Bernoulli prob)
+    We interpret emission_p_good as p(state=good | x_t) proxy and do a pragmatic smoothing:
+    Use likelihoods L_good = p, L_bad = 1-p.
     """
-    p1 = np.asarray(p1, dtype=np.float64)
-    T = int(p1.shape[0])
-    if T == 0:
-        return p1
+    p = np.clip(emission_p_good.astype(np.float64), hmm.eps, 1.0 - hmm.eps)
+    T = p.shape[0]
 
-    p1 = np.clip(p1, 1e-9, 1.0 - 1e-9)
-    e = np.stack([1.0 - p1, p1], axis=1)  # (T,2)
+    # Transition matrix A[s_prev, s_next]
+    a11 = hmm.p_stay_bad
+    a10 = 1.0 - a11
+    a00 = hmm.p_stay_good
+    a01 = 1.0 - a00
+    # NOTE: we store in order [bad, good]
+    A = np.array([[a11, a10], [a01, a00]], dtype=np.float64)
 
-    alpha = np.zeros((T, 2), dtype=np.float64)
-    c = np.zeros((T,), dtype=np.float64)
+    pi_good = float(np.clip(hmm.prior_good, hmm.eps, 1.0 - hmm.eps))
+    pi = np.array([1.0 - pi_good, pi_good], dtype=np.float64)
 
-    # init
-    alpha[0] = pi * e[0]
-    c[0] = alpha[0].sum()
-    if c[0] <= 0:
-        c[0] = 1e-12
-    alpha[0] /= c[0]
+    # log-likelihoods
+    ll = np.stack([np.log(1.0 - p), np.log(p)], axis=1)  # (T,2)
 
     # forward
+    alpha = np.zeros((T, 2), dtype=np.float64)
+    alpha[0] = np.log(pi) + ll[0]
     for t in range(1, T):
-        alpha[t] = (alpha[t - 1] @ A) * e[t]
-        c[t] = alpha[t].sum()
-        if c[t] <= 0:
-            c[t] = 1e-12
-        alpha[t] /= c[t]
+        # logsumexp over prev state
+        prev = alpha[t - 1][:, None] + np.log(A)  # (2,2)
+        m = prev.max(axis=0)
+        alpha[t] = m + np.log(np.exp(prev - m).sum(axis=0)) + ll[t]
 
     # backward
     beta = np.zeros((T, 2), dtype=np.float64)
-    beta[T - 1] = 1.0
+    beta[T - 1] = 0.0
     for t in range(T - 2, -1, -1):
-        beta[t] = (A @ (e[t + 1] * beta[t + 1]))
-        beta[t] /= c[t + 1]
+        nxt = beta[t + 1] + ll[t + 1]  # (2,)
+        tmp = np.log(A) + nxt[None, :]  # (2,2)
+        m = tmp.max(axis=1)
+        beta[t] = m + np.log(np.exp(tmp - m[:, None]).sum(axis=1))
 
-    gamma = alpha * beta
-    denom = gamma.sum(axis=1, keepdims=True)
-    denom = np.clip(denom, 1e-12, None)
-    gamma /= denom
-    return gamma[:, 1]
+    # posterior
+    post = alpha + beta
+    m = post.max(axis=1, keepdims=True)
+    post = np.exp(post - m)
+    post = post / (post.sum(axis=1, keepdims=True) + hmm.eps)
+    w = post[:, 1]  # good
+    return w.astype(np.float32)
 
 
-def build_hmm_params(cfg_hmm: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-    A00 = float(cfg_hmm.get("A00", 0.95))
-    A01 = float(cfg_hmm.get("A01", 0.05))
-    A10 = float(cfg_hmm.get("A10", 0.05))
-    A11 = float(cfg_hmm.get("A11", 0.95))
-    A = np.array([[A00, A01], [A10, A11]], dtype=np.float64)
-    # row-normalize
-    A = A / np.clip(A.sum(axis=1, keepdims=True), 1e-12, None)
+def fit_emission_model(X: np.ndarray, y: np.ndarray, *, c: float = 1.0, max_iter: int = 2000) -> LogisticRegression:
+    clf = LogisticRegression(
+        C=float(c),
+        max_iter=int(max_iter),
+        solver="lbfgs",
+        n_jobs=1,
+    )
+    clf.fit(X, y)
+    return clf
 
-    pi0 = float(cfg_hmm.get("pi0", 0.5))
-    pi1 = float(cfg_hmm.get("pi1", 0.5))
-    pi = np.array([pi0, pi1], dtype=np.float64)
-    pi = pi / np.clip(pi.sum(), 1e-12, None)
-    return A, pi
+
+def emission_metrics(p: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+    auroc = roc_auc_score(y, p) if len(np.unique(y)) > 1 else float("nan")
+    ece = ece_score(p, y)
+    r50 = risk_at_coverage(p, y, coverage=0.5)
+    return {"auroc": float(auroc), "ece": float(ece), "risk@50%": float(r50)}
