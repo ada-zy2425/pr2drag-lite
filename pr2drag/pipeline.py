@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,38 @@ from .utils import (
     write_json,
 )
 
+def _resolve_davis_root(davis_root: Union[str, Path]) -> Path:
+    """
+    Make davis_root robust:
+    - accept either .../DAVIS  (contains JPEGImages/Annotations/ImageSets)
+    - or accept its parent that contains DAVIS/ subfolder
+    """
+    p = Path(davis_root).expanduser()
+
+    # if user passed something like "" or None accidentally
+    if str(p).strip() == "":
+        raise ValueError("[DAVIS] davis_root is empty. Please set cfg['davis_root'] correctly.")
+
+    # Case A: already points to DAVIS root
+    if (p / "JPEGImages").is_dir() and (p / "Annotations").is_dir() and (p / "ImageSets").is_dir():
+        return p
+
+    # Case B: user passed parent dir, and inside it there is DAVIS/
+    cand = p / "DAVIS"
+    if (cand / "JPEGImages").is_dir() and (cand / "Annotations").is_dir() and (cand / "ImageSets").is_dir():
+        return cand
+
+    # Helpful diagnostics
+    raise FileNotFoundError(
+        "[DAVIS] Cannot resolve davis_root.\n"
+        f"  given: {p}\n"
+        "  expected structure:\n"
+        "    davis_root/\n"
+        "      JPEGImages/\n"
+        "      Annotations/\n"
+        "      ImageSets/\n"
+        "  or parent containing davis_root/DAVIS/...\n"
+    )
 
 def _list_seq_from_split(davis_root: Path, split_rel: str) -> List[str]:
     split_path = davis_split_path(davis_root, split_rel)
@@ -36,37 +68,62 @@ def _list_seq_from_split(davis_root: Path, split_rel: str) -> List[str]:
     return read_txt_lines(split_path)
 
 
-def davis_frame_paths(davis_root: Path, res: str, seq: str) -> Tuple[List[Path], List[Path]]:
+def davis_frame_paths(davis_root: Union[str, Path], res: str, seq: str) -> Tuple[List[Path], List[Path]]:
     """
-    DAVIS layout:
-      davis_root/JPEGImages/480p/<seq>/00000.jpg
-      davis_root/Annotations/480p/<seq>/00000.png
+    Return aligned (frames, annos) path lists for a DAVIS sequence.
+
+    frames: JPEGImages/{res}/{seq}/*.jpg (or *.png fallback)
+    annos : Annotations/{res}/{seq}/*.png
+    Alignment is by filename stem (e.g. 00000).
     """
-    img_dir = davis_root / "JPEGImages" / res / seq
-    ann_dir = davis_root / "Annotations" / res / seq
+    root = _resolve_davis_root(davis_root)
+    res = str(res)
+    seq = str(seq)
 
-    if not img_dir.exists():
-        raise FileNotFoundError(f"[DAVIS] Missing image dir: {img_dir}")
-    if not ann_dir.exists():
-        raise FileNotFoundError(f"[DAVIS] Missing annotation dir: {ann_dir}")
+    img_dir = root / "JPEGImages" / res / seq
+    ann_dir = root / "Annotations" / res / seq
 
+    if not img_dir.is_dir():
+        # extra hint for common mistakes
+        avail_res = (root / "JPEGImages").glob("*")
+        avail_res = [p.name for p in avail_res if p.is_dir()]
+        raise FileNotFoundError(
+            f"[DAVIS] Missing image directory:\n  {img_dir}\n"
+            f"[hint] available resolutions under {root/'JPEGImages'}: {avail_res}\n"
+            f"[hint] check cfg.res and cfg.davis_root"
+        )
+    if not ann_dir.is_dir():
+        raise FileNotFoundError(f"[DAVIS] Missing annotation directory:\n  {ann_dir}")
+
+    # DAVIS is usually jpg, but keep fallback for safety
     frames = sorted(img_dir.glob("*.jpg"))
-    if len(frames) == 0:
+    if not frames:
         frames = sorted(img_dir.glob("*.png"))
-    if len(frames) == 0:
-        raise FileNotFoundError(f"[DAVIS] No frames in: {img_dir}")
+    if not frames:
+        raise FileNotFoundError(f"[DAVIS] No frames found in: {img_dir}")
 
+    annos_all = sorted(ann_dir.glob("*.png"))
+    if not annos_all:
+        raise FileNotFoundError(f"[DAVIS] No annotations found in: {ann_dir}")
+
+    anno_map = {p.stem: p for p in annos_all}
     annos: List[Path] = []
+    missing = []
     for fp in frames:
-        stem = fp.stem
-        cand = ann_dir / f"{stem}.png"
-        if not cand.exists():
-            cand2 = ann_dir / f"{stem}.jpg"
-            if cand2.exists():
-                cand = cand2
-        if not cand.exists():
-            raise FileNotFoundError(f"[DAVIS] Missing annotation for frame {fp.name}: tried {cand}")
-        annos.append(cand)
+        ap = anno_map.get(fp.stem)
+        if ap is None:
+            missing.append(fp.name)
+        else:
+            annos.append(ap)
+
+    if missing:
+        # DAVIS should have dense masks; if missing, better fail loudly
+        sample = missing[:5]
+        raise FileNotFoundError(
+            f"[DAVIS] Missing {len(missing)} annotation(s) in {ann_dir}.\n"
+            f"  examples: {sample}\n"
+            f"[hint] verify DAVIS extraction is complete and uses the same frame naming."
+        )
 
     return frames, annos
 
