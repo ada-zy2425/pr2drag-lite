@@ -131,6 +131,7 @@ def aob_fill(
     w: np.ndarray,
     tau: float,
     params: AoBParams,
+    debug: List[dict] | None = None,   # <- 新增
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Given base trajectory z_base (T,D) and reliability w (T,),
@@ -185,7 +186,17 @@ def aob_fill(
             and (a_k >= params.eps_gate)
             and (seg_len <= int(params.max_bridge_len))
         )
-
+        
+        if debug is not None:
+            debug.append({
+                "s": int(s), "e": int(e), "len": int(e - s + 1),
+                "left": int(left), "right": int(right),
+                "has_left": bool(has_left), "has_right": bool(has_right),
+                "Lk": float(Lk), "uk": float(uk), "a_k": float(a_k),
+                "do_bridge": bool(do_bridge),
+                "mode": "bridge" if do_bridge else f"abstain:{params.abstain_mode}",
+            })
+            
         if do_bridge:
             n_interior = seg_len
             zL = z_final[left]
