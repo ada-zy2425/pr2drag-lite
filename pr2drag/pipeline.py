@@ -1,4 +1,5 @@
 # pr2drag/pipeline.py
+from __future__ import annotations
 import os
 debug_aob = os.environ.get("PR2DRAG_DEBUG_AOB", "0") == "1"
 debug_seqs = set(
@@ -8,7 +9,6 @@ debug_seqs = set(
     ).split(",") if s.strip()
 )
 
-from __future__ import annotations
 
 import math
 from pathlib import Path
