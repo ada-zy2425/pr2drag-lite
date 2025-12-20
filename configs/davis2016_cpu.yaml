@@ -79,5 +79,9 @@ stage3:
   analysis:
     write_csv: true
     write_figs: true
-
-
+    log_to_file: true
+    archive:
+      enable: true
+      pack_root: "_paperpack"   # 相对 base_out；也可以写绝对路径
+      zip: true
+      copy_out_dir: false       # 默认只打包 _analysis；如想把整个 out_dir 也复制进去就改 true
