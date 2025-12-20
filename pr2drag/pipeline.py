@@ -465,7 +465,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         eta_L=float(aob_cfg.get("eta_L", 0.18)),
         eta_u=float(aob_cfg.get("eta_u", 0.65)),
         max_bridge_len=int(aob_cfg.get("max_bridge_len", 20)),
+        bridge_mode=str(aob_cfg.get("bridge_mode", "hermite")).lower(),
+        hermite_scan=int(aob_cfg.get("hermite_scan", 6)),
+        clamp_hermite=bool(aob_cfg.get("clamp_hermite", True)),
+        clamp_margin_px=float(aob_cfg.get("clamp_margin_px", 0.0)),
     )
+
 
     # -----------------
     # load stage2 arrays

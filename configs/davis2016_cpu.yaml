@@ -53,6 +53,11 @@ stage3:
     eta_L: 0.05            # 长度惩罚减弱（关键）
     eta_u: 0.65            # 先不动也行
 
+    bridge_mode: hermite
+    hermite_scan: 6
+    clamp_hermite: true
+    clamp_margin_px: 0.0
+    
   metrics:
     fail_px: 50.0
 
