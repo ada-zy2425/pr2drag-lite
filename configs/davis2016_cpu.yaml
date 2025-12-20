@@ -40,6 +40,12 @@ stage3:
     method: isotonic
     bins: 50
 
+  feature_scaler:
+    enable: true
+    type: robust_iqr
+    clip: 8.0
+    eps: 1e-6
+
 
   hmm:
     prior_good: 0.85
@@ -73,4 +79,3 @@ stage3:
   analysis:
     write_csv: true
     write_figs: true
-
