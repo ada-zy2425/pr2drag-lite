@@ -1,4 +1,13 @@
 # pr2drag/pipeline.py
+import os
+debug_aob = os.environ.get("PR2DRAG_DEBUG_AOB", "0") == "1"
+debug_seqs = set(
+    s.strip() for s in os.environ.get(
+        "PR2DRAG_DEBUG_AOB_SEQS",
+        "breakdance,horsejump-high,soapbox"
+    ).split(",") if s.strip()
+)
+
 from __future__ import annotations
 
 import math
@@ -608,8 +617,47 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         else:
             raise ValueError(f"Unknown tau_mode={tau_mode}")
 
-        z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=w, tau=tau, params=aobp)
+        seg_debug = [] if (debug_aob and seq in debug_seqs) else None
+        z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=w, tau=tau, params=aobp, debug=seg_debug)
+        
+        if debug_aob and seq in debug_seqs:
+            Tseq = int(len(w))
+            q = np.quantile(w.astype(np.float64), [0.0, 0.01, 0.05, 0.5, 0.95, 0.99, 1.0]).tolist()
+            low_mask = (is_bridge | is_abst)
+            low_n = int(low_mask.sum())
 
+            err_obs = np.linalg.norm((z_obs - z_gt).astype(np.float64), axis=1)
+            err_fin = np.linalg.norm((z_fin - z_gt).astype(np.float64), axis=1)
+
+            def _q95(x): 
+                return float(np.quantile(x, 0.95)) if x.size else float("nan")
+
+            pbar.write(
+                f"[AoB-Debug] seq={seq} tau={tau:.6f} "
+                f"w[q0,q1,q5,q50,q95,q99,q100]={['%.4f'%v for v in q]} "
+                f"low_frac={low_n/max(Tseq,1):.4f} low_n={low_n} segs={0 if seg_debug is None else len(seg_debug)}"
+            )
+            if low_n > 0:
+                pbar.write(
+                    f"[AoB-Debug] seq={seq} err_obs_p95_all={_q95(err_obs):.3f} err_fin_p95_all={_q95(err_fin):.3f} "
+                    f"err_obs_p95_low={_q95(err_obs[low_mask]):.3f} err_fin_p95_low={_q95(err_fin[low_mask]):.3f}"
+                )
+
+            # 写 JSON，方便你之后离线看每段决策
+            write_json(analysis_dir / f"debug_aob_{seq}.json", {
+                "seq": seq,
+                "tau": float(tau),
+                "aobp": {
+                    "eps_gate": aobp.eps_gate,
+                    "abstain_mode": aobp.abstain_mode,
+                    "eta_L": aobp.eta_L,
+                    "eta_u": aobp.eta_u,
+                    "max_bridge_len": aobp.max_bridge_len,
+                },
+                "w_quantiles": q,
+                "segments": seg_debug if seg_debug is not None else [],
+            })
+            
         sm = compute_seq_metrics(
             seq=seq,
             z_gt=z_gt,
