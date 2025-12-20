@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import math
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
 
@@ -48,8 +47,6 @@ debug_seqs = set(
     ).split(",")
     if s.strip()
 )
-
-debug_gate = os.environ.get("PR2DRAG_DEBUG_GATE", "0") == "1"
 
 
 # ============================================================
@@ -184,7 +181,7 @@ def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
         "stage1": cfg.get("stage1", {}),
         "stage2": cfg.get("stage2", {}),
         "stage3": cfg.get("stage3", {}),
-        "version": "0.3.2-lite-risk-wcalib-tieaware-valdiag",
+        "version": "0.3.1-lite-risk-wcalib-tieaware+reliability_ci_fix",
     }
     return sha1_of_dict(pick)
 
@@ -308,18 +305,9 @@ def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, o
     sig = _stage_signature(cfg, stage=f"stage2-{split}-feat{feat_mode}")
 
     meta_path = stage1_dir / "meta.json"
-    seqs: List[str]
     if meta_path.exists():
-        # robust json load (avoid pandas schema quirks)
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            seqs = list(meta.get("seqs", []))
-        except Exception:
-            try:
-                meta_pd = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
-                seqs = list(meta_pd.get("seqs", []))
-            except Exception:
-                seqs = sorted([p.stem for p in stage1_dir.glob("*.npz")])
+        meta = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
+        seqs = list(meta.get("seqs", []))
     else:
         seqs = sorted([p.stem for p in stage1_dir.glob("*.npz")])
 
@@ -415,7 +403,9 @@ def _robust_iqr_apply(
     center = np.array(scaler.get("center", []), dtype=np.float64)
     scale = np.array(scaler.get("scale", []), dtype=np.float64)
     if center.size != X.shape[1] or scale.size != X.shape[1]:
-        raise ValueError(f"[Scaler] shape mismatch: center/scale dims={center.size}/{scale.size} but X has {X.shape[1]} dims")
+        raise ValueError(
+            f"[Scaler] shape mismatch: center/scale dims={center.size}/{scale.size} but X has {X.shape[1]} dims"
+        )
     Z = (X.astype(np.float64) - center[None, :]) / scale[None, :]
     if clip is not None:
         Z = np.clip(Z, -float(clip), float(clip))
@@ -442,6 +432,152 @@ def _feature_stats(X: np.ndarray) -> Dict[str, Any]:
 
 
 # ============================================================
+# Reliability plotting helpers (FIXED: yerr >= 0 always)
+# ============================================================
+def _z_value(alpha: float) -> float:
+    a = float(alpha)
+    if abs(a - 0.05) < 1e-12:
+        return 1.959963984540054  # 95%
+    try:
+        from scipy.stats import norm  # type: ignore
+        return float(norm.ppf(1.0 - a / 2.0))
+    except Exception:
+        return 1.959963984540054
+
+
+def _binomial_ci_wilson(k: int, n: int, *, alpha: float = 0.05) -> Tuple[float, float]:
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    k = int(k)
+    n = int(n)
+    p = float(k) / float(n)
+    z = _z_value(alpha)
+    z2 = z * z
+    den = 1.0 + z2 / float(n)
+    center = (p + z2 / (2.0 * float(n))) / den
+    half = (z * math.sqrt((p * (1.0 - p) / float(n)) + (z2 / (4.0 * float(n) * float(n))))) / den
+    lo = center - half
+    hi = center + half
+    lo = float(np.clip(lo, 0.0, 1.0))
+    hi = float(np.clip(hi, 0.0, 1.0))
+    # enforce lo <= p <= hi (robust against tiny numeric issues)
+    lo = min(lo, p)
+    hi = max(hi, p)
+    return lo, hi
+
+
+def _reliability_bins(
+    w: np.ndarray,
+    y: np.ndarray,
+    *,
+    nbins: int = 10,
+    alpha: float = 0.05,
+    min_count: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      x: bin centers
+      p: empirical mean(y)
+      lo, hi: Wilson CI
+      cnt: bin counts
+    """
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if w.size == 0 or y.size != w.size:
+        return (
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    edges = np.linspace(0.0, 1.0, int(nbins) + 1)
+    xs: List[float] = []
+    ps: List[float] = []
+    los: List[float] = []
+    his: List[float] = []
+    cnts: List[int] = []
+
+    for i in range(int(nbins)):
+        lo_e, hi_e = float(edges[i]), float(edges[i + 1])
+        if i < int(nbins) - 1:
+            m = (w >= lo_e) & (w < hi_e)
+        else:
+            m = (w >= lo_e) & (w <= hi_e)
+
+        n = int(np.sum(m))
+        if n < int(min_count):
+            continue
+
+        yy = y[m]
+        k = int(np.sum(yy >= 0.5))  # y is 0/1 in your case
+        p = float(k) / float(n)
+        lo_ci, hi_ci = _binomial_ci_wilson(k, n, alpha=alpha)
+
+        xs.append(0.5 * (lo_e + hi_e))
+        ps.append(p)
+        los.append(lo_ci)
+        his.append(hi_ci)
+        cnts.append(n)
+
+    return (
+        np.asarray(xs, dtype=np.float64),
+        np.asarray(ps, dtype=np.float64),
+        np.asarray(los, dtype=np.float64),
+        np.asarray(his, dtype=np.float64),
+        np.asarray(cnts, dtype=np.int64),
+    )
+
+
+def _plot_reliability(
+    w: np.ndarray,
+    y: np.ndarray,
+    *,
+    out_path: Union[str, Path],
+    title: str,
+    xlabel: str = "w bin center",
+    ylabel: str = "empirical P(y=1)",
+    nbins: int = 10,
+    alpha: float = 0.05,
+    min_count: int = 1,
+) -> None:
+    out_path = Path(out_path)
+    x, p, lo, hi, cnt = _reliability_bins(w, y, nbins=nbins, alpha=alpha, min_count=min_count)
+    if x.size == 0:
+        return
+
+    # sanitize (critical fix)
+    p = np.clip(p, 0.0, 1.0)
+    lo = np.clip(lo, 0.0, 1.0)
+    hi = np.clip(hi, 0.0, 1.0)
+
+    # enforce lo <= p <= hi elementwise
+    lo = np.minimum(lo, p)
+    hi = np.maximum(hi, p)
+
+    yerr_low = np.clip(p - lo, 0.0, np.inf)
+    yerr_high = np.clip(hi - p, 0.0, np.inf)
+    yerr = np.vstack([yerr_low, yerr_high])  # shape (2, N)
+
+    # filter non-finite just in case
+    m = np.isfinite(x) & np.isfinite(p) & np.isfinite(yerr_low) & np.isfinite(yerr_high)
+    x, p, yerr = x[m], p[m], yerr[:, m]
+    if x.size == 0:
+        return
+
+    plt.figure()
+    plt.errorbar(x, p, yerr=yerr, fmt="o-")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.ylim(-0.02, 1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+# ============================================================
 # w calibration (isotonic preferred, fallback to binning)
 # ============================================================
 class _WCalibrator:
@@ -450,7 +586,7 @@ class _WCalibrator:
         self.bins = int(bins)
         self.eps = float(eps)
 
-        self._iso = None  # sklearn model
+        self._iso = None
         self._bin_edges: Optional[np.ndarray] = None
         self._bin_vals: Optional[np.ndarray] = None
 
@@ -542,181 +678,9 @@ class _WCalibrator:
             d["type"] = "identity"
         return d
 
-    @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "_WCalibrator":
-        method = str(d.get("method", d.get("type", "identity"))).lower()
-        bins = int(d.get("bins", 50))
-        eps = float(d.get("eps", 1e-8))
-        cal = _WCalibrator(method=method, bins=bins, eps=eps)
-        typ = str(d.get("type", method)).lower()
-        if typ == "isotonic":
-            try:
-                from sklearn.isotonic import IsotonicRegression  # type: ignore
-                iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-                iso.X_thresholds_ = np.asarray(d.get("x", []), dtype=np.float64)
-                iso.y_thresholds_ = np.asarray(d.get("y", []), dtype=np.float64)
-                cal._iso = iso
-            except Exception:
-                cal._iso = None
-        elif typ == "binning":
-            cal._bin_edges = np.asarray(d.get("edges", [0.0, 1.0]), dtype=np.float64)
-            cal._bin_vals = np.asarray(d.get("vals", [0.5]), dtype=np.float64)
-        return cal
-
 
 # ============================================================
-# Reliability utilities (Wilson CI + bins that respect ties)
-# ============================================================
-def _wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
-    """Wilson score interval for binomial proportion."""
-    if n <= 0:
-        return (float("nan"), float("nan"))
-    phat = float(k) / float(n)
-    denom = 1.0 + (z * z) / float(n)
-    center = (phat + (z * z) / (2.0 * float(n))) / denom
-    half = (z / denom) * math.sqrt((phat * (1.0 - phat) / float(n)) + (z * z) / (4.0 * float(n) * float(n)))
-    lo = max(0.0, center - half)
-    hi = min(1.0, center + half)
-    return lo, hi
-
-
-def _risk_coverage(w: np.ndarray, y: np.ndarray, *, tau: float) -> Dict[str, float]:
-    w = np.asarray(w, dtype=np.float64).reshape(-1)
-    y = np.asarray(y, dtype=np.int64).reshape(-1)
-    n = int(w.size)
-    if n == 0 or y.size != n:
-        return {"tau": float(tau), "coverage": float("nan"), "risk": float("nan"), "kept_n": 0.0, "n": float(n)}
-    kept = (w >= float(tau))
-    kept_n = int(np.sum(kept))
-    cov = float(kept_n) / float(n)
-    if kept_n == 0:
-        risk = float("nan")
-    else:
-        risk = float(np.mean((1 - y[kept]).astype(np.float64)))
-    return {"tau": float(tau), "coverage": cov, "risk": risk, "kept_n": float(kept_n), "n": float(n)}
-
-
-def _reliability_table(
-    w: np.ndarray,
-    y: np.ndarray,
-    *,
-    mode: str = "auto",
-    n_bins: int = 10,
-    min_count: int = 20,
-) -> pd.DataFrame:
-    """
-    Build reliability table robust to ties.
-    - mode='unique': one point per unique w (sorted), with counts.
-    - mode='quantile': quantile bins (tries to avoid empty bins).
-    - mode='auto': unique if few unique levels else quantile.
-    """
-    w = np.asarray(w, dtype=np.float64).reshape(-1)
-    y = np.asarray(y, dtype=np.int64).reshape(-1)
-    if w.size == 0 or y.size != w.size:
-        return pd.DataFrame(columns=["lo", "hi", "center", "count", "pos_rate", "ci_low", "ci_high"])
-
-    mode = str(mode).lower()
-    uniq = np.unique(w)
-    if mode == "auto":
-        # isotonic often creates few levels; in that case unique-level is the only honest plot
-        mode = "unique" if uniq.size <= max(30, 3 * int(n_bins)) else "quantile"
-
-    rows: List[Dict[str, float]] = []
-
-    if mode == "unique":
-        vals = np.sort(uniq)
-        for v in vals:
-            m = (w == v)
-            c = int(np.sum(m))
-            if c <= 0:
-                continue
-            k = int(np.sum(y[m] == 1))
-            pos = float(k) / float(c)
-            lo, hi = _wilson_ci(k, c)
-            rows.append(
-                {
-                    "lo": float(v),
-                    "hi": float(v),
-                    "center": float(v),
-                    "count": float(c),
-                    "pos_rate": pos,
-                    "ci_low": float(lo),
-                    "ci_high": float(hi),
-                }
-            )
-
-    elif mode == "quantile":
-        nb = max(2, int(n_bins))
-        qs = np.linspace(0.0, 1.0, nb + 1)
-        edges = np.quantile(w, qs)
-        edges = np.unique(edges)
-        if edges.size < 3:
-            # fallback to equal-width
-            edges = np.linspace(float(np.min(w)), float(np.max(w)), nb + 1)
-        for i in range(edges.size - 1):
-            lo_e, hi_e = float(edges[i]), float(edges[i + 1])
-            if i < edges.size - 2:
-                m = (w >= lo_e) & (w < hi_e)
-            else:
-                m = (w >= lo_e) & (w <= hi_e)
-            c = int(np.sum(m))
-            if c <= 0:
-                continue
-            if c < int(min_count):
-                # still keep it (don’t hide small bins), but CI will reflect uncertainty
-                pass
-            k = int(np.sum(y[m] == 1))
-            pos = float(k) / float(c)
-            ci_lo, ci_hi = _wilson_ci(k, c)
-            rows.append(
-                {
-                    "lo": lo_e,
-                    "hi": hi_e,
-                    "center": 0.5 * (lo_e + hi_e),
-                    "count": float(c),
-                    "pos_rate": pos,
-                    "ci_low": float(ci_lo),
-                    "ci_high": float(ci_hi),
-                }
-            )
-    else:
-        raise ValueError(f"[Reliability] unknown mode={mode}")
-
-    return pd.DataFrame(rows)
-
-
-def _plot_reliability(df_rel: pd.DataFrame, *, title: str, out_png: Path) -> None:
-    if df_rel is None or len(df_rel) == 0:
-        return
-    x = df_rel["center"].values.astype(np.float64)
-    y = df_rel["pos_rate"].values.astype(np.float64)
-    lo = df_rel["ci_low"].values.astype(np.float64)
-    hi = df_rel["ci_high"].values.astype(np.float64)
-    yerr = np.vstack([y - lo, hi - y])
-    plt.figure()
-    plt.errorbar(x, y, yerr=yerr, fmt="o-")
-    plt.xlabel("wtil (bin center)")
-    plt.ylabel("empirical P(y=1)")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=160)
-    plt.close()
-
-
-def _dump_w_ties(w: np.ndarray, *, topk: int = 20) -> Dict[str, Any]:
-    w = np.asarray(w, dtype=np.float64).reshape(-1)
-    if w.size == 0:
-        return {"n": 0, "unique": 0, "top": []}
-    vals, cnt = np.unique(w, return_counts=True)
-    idx = np.argsort(-cnt)
-    top = []
-    for i in idx[: int(topk)]:
-        top.append({"w": float(vals[i]), "count": int(cnt[i]), "frac": float(cnt[i]) / float(w.size)})
-    return {"n": int(w.size), "unique": int(vals.size), "top": top}
-
-
-# ============================================================
-# tau selection (tie-aware, consistent with kept={w>=tau})
+# tau selection (tie-aware)
 # ============================================================
 def _select_tau_risk_constrained_tieaware(
     w: np.ndarray,
@@ -726,32 +690,19 @@ def _select_tau_risk_constrained_tieaware(
     min_keep_frac: float = 0.05,
     tau_min: float = 1e-6,
     tau_max: float = 0.999999,
-    policy: str = "max_coverage",
-    risk_margin: float = 0.0,
 ) -> Tuple[float, Dict[str, float], pd.DataFrame]:
-    """
-    Tie-aware tau selection over kept set {w>=tau}.
-    risk = P(y=0 | kept), coverage = kept_frac.
-
-    policy:
-      - max_coverage: maximize coverage s.t. risk <= (r0 - risk_margin)
-      - min_risk: among ks>=min_keep, pick minimal risk (then maximal coverage tie-break)
-    """
     w = np.asarray(w, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.int64).reshape(-1)
     n = int(w.size)
-    policy = str(policy).lower().strip()
-
     if n == 0 or y.size != n:
         tau = clamp(0.5, tau_min, tau_max)
         df = pd.DataFrame({"tau": [], "k": [], "coverage": [], "risk": []})
         return tau, {"coverage": float("nan"), "risk": float("nan")}, df
 
-    idx = np.argsort(-w)  # desc
+    idx = np.argsort(-w)
     ws = w[idx]
     ys = y[idx]
-    bad = 1 - ys  # 1 if y=0
-
+    bad = 1 - ys
     cum_bad = np.cumsum(bad, dtype=np.float64)
 
     change = np.r_[ws[1:] != ws[:-1], True]
@@ -763,39 +714,19 @@ def _select_tau_risk_constrained_tieaware(
     taus = ws[ends]
 
     min_keep = max(1, int(math.ceil(float(min_keep_frac) * n)))
-    valid = (ks >= min_keep)
-
-    r_eff = float(r0) - float(risk_margin)
-    r_eff = max(0.0, r_eff)
-
-    feasible = valid & (risks <= r_eff)
+    feasible = (ks >= min_keep) & (risks <= float(r0))
 
     if np.any(feasible):
-        if policy == "min_risk":
-            rr = risks[feasible]
-            cc = covs[feasible]
-            ii = np.where(feasible)[0]
-            # pick minimal risk; tie-break by max coverage
-            rmin = float(np.min(rr))
-            cand = ii[np.where(rr == rmin)[0]]
-            i_star = int(cand[np.argmax(cc[np.where(rr == rmin)[0]])])
-        else:
-            # default: max coverage among feasible
-            i_star = int(np.where(feasible)[0].max())
+        i_star = int(np.where(feasible)[0].max())
     else:
-        # fallback: among valid, pick minimal risk (then max coverage)
+        valid = ks >= min_keep
         if np.any(valid):
-            rr = risks[valid]
-            cc = covs[valid]
-            ii = np.where(valid)[0]
-            rmin = float(np.min(rr))
-            cand = ii[np.where(rr == rmin)[0]]
-            i_star = int(cand[np.argmax(cc[np.where(rr == rmin)[0]])])
+            i_star = int(np.where(valid)[0][np.argmin(risks[valid])])
         else:
             i_star = 0
 
-    tau_raw = float(taus[i_star])
-    tau = clamp(tau_raw, tau_min, tau_max)
+    tau = float(taus[i_star])
+    tau = clamp(tau, tau_min, tau_max)
 
     df = pd.DataFrame({"tau": taus, "k": ks, "coverage": covs, "risk": risks})
     summary = {
@@ -804,17 +735,7 @@ def _select_tau_risk_constrained_tieaware(
         "k": float(ks[i_star]),
         "n": float(n),
         "min_keep": float(min_keep),
-        "r0": float(r0),
-        "r_eff": float(r_eff),
-        "policy": float("nan"),  # overwritten below
-        "tau_raw": float(tau_raw),
-        "tau_clamped": float(tau),
-        "risk_margin": float(risk_margin),
-        "min_keep_frac": float(min_keep_frac),
     }
-    # store policy as string-ish via json later; keep float here for type-compat, but we will write dict properly upstream
-    # (we return summary as Dict[str,float] for historical reasons)
-    # caller will re-pack a richer dict with policy string.
     return tau, summary, df
 
 
@@ -837,30 +758,19 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     tau_min = float(s3.get("tau_min", 1e-6))
     tau_max = float(s3.get("tau_max", 0.999999))
 
-    # risk-constrained tau config
     r0 = float(s3.get("tau_risk", 0.05))
     min_keep_frac = float(s3.get("tau_min_keep_frac", 0.05))
-    tau_risk_policy = str(s3.get("tau_risk_policy", "max_coverage")).lower()
-    tau_risk_margin = float(s3.get("tau_risk_margin", 0.0))
 
-    # feature scaling
     sc_cfg = dict(s3.get("feature_scaler", {}))
     sc_enable = bool(sc_cfg.get("enable", True))
     sc_type = str(sc_cfg.get("type", "robust_iqr")).lower()
     sc_clip = float(sc_cfg.get("clip", 8.0))
     sc_eps = float(sc_cfg.get("eps", 1e-6))
 
-    # w calibration
     wc_cfg = dict(s3.get("w_calibration", {}))
     wc_enable = bool(wc_cfg.get("enable", False))
     wc_method = str(wc_cfg.get("method", "isotonic")).lower()
     wc_bins = int(wc_cfg.get("bins", 50))
-
-    # reliability plot config
-    rel_cfg = dict(s3.get("reliability", {}))
-    rel_mode = str(rel_cfg.get("mode", "auto")).lower()  # auto|unique|quantile
-    rel_bins = int(rel_cfg.get("bins", 10))
-    rel_min_count = int(rel_cfg.get("min_count", 20))
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -882,11 +792,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         clamp_margin_px=float(aob_cfg.get("clamp_margin_px", 0.0)),
     )
 
-    # -----------------
-    # load stage2 arrays
-    # -----------------
-    X_tr, y_tr, _err_tr = _concat_stage2(stage2_train)
-    X_va, y_va, _err_va = _concat_stage2(stage2_val)
+    X_tr, y_tr, _ = _concat_stage2(stage2_train)
+    X_va, y_va, _ = _concat_stage2(stage2_val)
 
     print(f"[Data] X_tr {tuple(X_tr.shape)} pos_rate {float(y_tr.mean()) if y_tr.size else float('nan')}")
     print(f"[Data] X_va {tuple(X_va.shape)} pos_rate {float(y_va.mean()) if y_va.size else float('nan')}")
@@ -901,13 +808,11 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     X_va_k_raw = X_va[:, keep].astype(np.float32)
     print(f"[Feat] keep dims: {keep} num_keep: {int(keep.sum())}")
 
-    # write feature stats (raw, before scaling)
     try:
         write_json(analysis_dir / "feature_stats_train.json", _feature_stats(X_tr_k_raw))
     except Exception as e:
         print(f"[Warn] failed to write feature_stats_train.json: {e}")
 
-    # fit scaler and transform
     scaler: Optional[Dict[str, Any]] = None
     if sc_enable:
         if sc_type != "robust_iqr":
@@ -922,9 +827,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         X_tr_k, X_va_k = X_tr_k_raw, X_va_k_raw
         print("[Feat] scaling disabled")
 
-    # -----------------
-    # emission model
-    # -----------------
     clf = fit_emission_model(
         X_tr_k, y_tr,
         c=float(em_cfg.get("c", 1.0)),
@@ -934,7 +836,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     p_tr_raw = clf.predict_proba(X_tr_k)[:, 1].astype(np.float32)
     p_va_raw = clf.predict_proba(X_va_k)[:, 1].astype(np.float32)
 
-    # Optional temperature scaling
     cal_cfg = dict(em_cfg.get("calibration", {}))
     cal_enable = bool(cal_cfg.get("enable", True))
     cal_eps = float(cal_cfg.get("eps", 1e-6))
@@ -952,9 +853,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     m = emission_metrics(p_va, y_va)
     print(f"[Emission] AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  risk@50%={m['risk@50%']:.4f}")
 
-    # -----------------
-    # helper: per-seq (scaled X -> p -> w_raw)
-    # -----------------
     def _seq_post_w_raw(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         arr, _ = npz_read(npz_path)
         X = arr["X"][:, keep].astype(np.float32)
@@ -962,19 +860,15 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             X = _robust_iqr_apply(X, scaler, clip=sc_clip)
         p_raw = clf.predict_proba(X)[:, 1].astype(np.float32)
         p = apply_temperature_scaling(p_raw, T, eps=cal_eps) if cal_enable else p_raw
-        w_raw = forward_backward_binary(p, hmm)  # in [0,1]
+        w_raw = forward_backward_binary(p, hmm)
         y = arr.get("y", np.zeros((w_raw.shape[0],), dtype=np.uint8)).astype(np.uint8)
         return w_raw.astype(np.float32), p.astype(np.float32), y
 
-    # -----------------
-    # w calibration: fit on TRAIN (w_raw -> wtil)
-    # -----------------
     wcal: Optional[_WCalibrator] = None
-
     if wc_enable:
         ws, ys = [], []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
-            w_raw, _p, y = _seq_post_w_raw(pth)
+            w_raw, _, y = _seq_post_w_raw(pth)
             ws.append(w_raw)
             ys.append(y.astype(np.uint8))
         w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
@@ -986,25 +880,19 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         else:
             wcal = _WCalibrator(method=wc_method, bins=wc_bins)
             wcal.fit(w_all, y_all)
-            wtil_tr_all = wcal.transform(w_all)
             write_json(analysis_dir / "w_calibrator.json", wcal.to_dict())
             print(f"[W-Calib] enabled method={wc_method} bins={wc_bins}")
 
-            # diagnose ties (train)
-            if debug_gate:
-                write_json(analysis_dir / "debug_wtil_ties_train.json", _dump_w_ties(wtil_tr_all))
-
-            # reliability curve on TRAIN after w calibration
             if bool(ana_cfg.get("write_figs", True)):
-                df_rel_tr = _reliability_table(
-                    wtil_tr_all, y_all,
-                    mode=rel_mode, n_bins=rel_bins, min_count=rel_min_count
-                )
-                df_rel_tr.to_csv(analysis_dir / "reliability_train_wcalib.csv", index=False)
+                wtil = wcal.transform(w_all)
                 _plot_reliability(
-                    df_rel_tr,
-                    title="Reliability (train, after w calibration) with 95% Wilson CI",
-                    out_png=analysis_dir / "fig_reliability_train_wcalib.png"
+                    wtil, y_all,
+                    out_path=analysis_dir / "fig_reliability_train_wcalib.png",
+                    title="Reliability curve on train (after w calibration)",
+                    xlabel="wtil bin center (calibrated)",
+                    nbins=10,
+                    alpha=0.05,
+                    min_count=1,
                 )
 
     def _w_to_wtil(w_raw: np.ndarray) -> np.ndarray:
@@ -1012,16 +900,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             return wcal.transform(w_raw)
         return np.clip(w_raw, 0.0, 1.0).astype(np.float32)
 
-    # -----------------
-    # tau selection (global)
-    # -----------------
     tau_global: float = 0.5
-    tau_summary_train: Dict[str, Any] = {}
 
     if tau_mode == "global":
         ws = []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
-            w_raw, _p, _y = _seq_post_w_raw(pth)
+            w_raw, _, _ = _seq_post_w_raw(pth)
             ws.append(_w_to_wtil(w_raw))
         w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
         if w_all.size == 0:
@@ -1030,59 +914,34 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             tau_global = float(np.quantile(w_all.astype(np.float64), target_frac))
             tau_global = clamp(tau_global, tau_min, tau_max)
         print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
-        tau_summary_train = {"policy": "quantile", "target_frac": float(target_frac), "tau": float(tau_global)}
 
     elif tau_mode == "risk":
         ws, ys = [], []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
-            w_raw, _p, y = _seq_post_w_raw(pth)
+            w_raw, _, y = _seq_post_w_raw(pth)
             ws.append(_w_to_wtil(w_raw))
             ys.append(y.astype(np.uint8))
         w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
         y_all = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
 
-        tau_global, summ_float, curve = _select_tau_risk_constrained_tieaware(
-            w_all, y_all,
-            r0=r0,
-            min_keep_frac=min_keep_frac,
-            tau_min=tau_min,
-            tau_max=tau_max,
-            policy=tau_risk_policy,
-            risk_margin=tau_risk_margin,
+        tau_global, summ, curve = _select_tau_risk_constrained_tieaware(
+            w_all, y_all, r0=r0, min_keep_frac=min_keep_frac, tau_min=tau_min, tau_max=tau_max
         )
-
-        # recompute exact train gate stats under the final tau (ground truth)
-        gate_tr = _risk_coverage(w_all, y_all, tau=tau_global)
-
         print(
-            f"[Tau] risk-constrained({tau_risk_policy}): tau_global={tau_global:.6f}  "
-            f"coverage={gate_tr['coverage']:.3f}  risk={gate_tr['risk']:.3f}  "
-            f"r0={r0} margin={tau_risk_margin}"
+            f"[Tau] risk-constrained: tau_global={tau_global:.6f}  "
+            f"coverage={summ['coverage']:.3f}  risk={summ['risk']:.3f}  r0={r0}"
         )
 
         curve.to_csv(analysis_dir / "tau_risk_curve_train.csv", index=False)
-
-        tau_summary_train = {
-            "coverage": gate_tr["coverage"],
-            "risk": gate_tr["risk"],
-            "k": gate_tr["kept_n"],
-            "n": gate_tr["n"],
-            "min_keep": float(max(1, int(math.ceil(min_keep_frac * float(gate_tr["n"]))))),
-            "r0": float(r0),
-            "r_eff": float(max(0.0, float(r0) - float(tau_risk_margin))),
-            "policy": str(tau_risk_policy),
-            "tau_raw": float(summ_float.get("tau_raw", tau_global)),
-            "tau_clamped": float(tau_global),
-            "risk_margin": float(tau_risk_margin),
-            "tau": float(tau_global),
-            "min_keep_frac": float(min_keep_frac),
-        }
-        write_json(analysis_dir / "tau_risk_summary_train.json", tau_summary_train)
+        write_json(
+            analysis_dir / "tau_risk_summary_train.json",
+            {**summ, "tau": tau_global, "r0": r0, "min_keep_frac": min_keep_frac},
+        )
 
         if bool(ana_cfg.get("write_figs", True)) and len(curve) > 0:
             plt.figure()
             plt.plot(curve["coverage"].values, curve["risk"].values)
-            plt.axhline(max(0.0, float(r0) - float(tau_risk_margin)), linestyle="--")
+            plt.axhline(r0, linestyle="--")
             plt.xlabel("coverage (kept fraction)")
             plt.ylabel("risk (P(y=0 | kept))")
             plt.title("Coverage–Risk curve (train, tie-aware)")
@@ -1096,9 +955,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     else:
         raise ValueError("Unknown tau_mode. Use: global | risk | per_video")
 
-    # -----------------
-    # eval on val seq-wise
-    # -----------------
     rows = []
     all_wtil_val = []
     all_err_obs_val = []
@@ -1123,7 +979,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         w_raw = forward_backward_binary(p, hmm).astype(np.float32)
         wtil = _w_to_wtil(w_raw)
 
-        if tau_mode == "global" or tau_mode == "risk":
+        if tau_mode in ("global", "risk"):
             tau = float(tau_global)
         elif tau_mode == "per_video":
             tau = float(np.quantile(wtil.astype(np.float64), target_frac)) if wtil.size else 0.5
@@ -1186,7 +1042,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
         all_wtil_val.append(wtil)
         all_err_obs_val.append(arr.get("err_obs", np.zeros((wtil.shape[0],), dtype=np.float32)).astype(np.float32))
-        all_y_val.append(y_seq.astype(np.uint8))
+        all_y_val.append(y_seq.astype(np.float32))
 
     df = pd.DataFrame(rows)
     if len(df) > 0:
@@ -1202,7 +1058,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         df.to_csv(csv_path, index=False)
         print(f"[OK] wrote: {csv_path}")
 
-    # correlation spearman(wtil, -err)
     try:
         from scipy.stats import spearmanr  # type: ignore
         wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
@@ -1218,41 +1073,21 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     print(f"[OK] wrote stage3 to: {out_dir}")
     print(f"  spearman(wtil, -err_obs) = {rho}")
 
-    # -----------------
-    # Gate diagnostics on VAL (same semantics as TRAIN)
-    # -----------------
-    if bool(ana_cfg.get("write_csv", True)) or bool(ana_cfg.get("write_figs", True)):
-        wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
-        ycat = np.concatenate(all_y_val, axis=0) if all_y_val else np.zeros((0,), dtype=np.uint8)
-
-        # ties on val
-        if debug_gate and wcat.size > 0:
-            write_json(analysis_dir / "debug_wtil_ties_val.json", _dump_w_ties(wcat))
-
-        # val gate risk/coverage (IMPORTANT: not just train)
-        if tau_mode in ("global", "risk"):
-            gate_val = _risk_coverage(wcat, ycat, tau=float(tau_global))
-            print(f"[Val gate] tau={gate_val['tau']:.6f}  coverage={gate_val['coverage']:.3f}  risk={gate_val['risk']:.3f}  kept_n={int(gate_val['kept_n'])}/{int(gate_val['n'])}")
-            write_json(analysis_dir / "val_gate_summary.json", gate_val)
-
-        # reliability (val)
-        if bool(ana_cfg.get("write_figs", True)) and wcat.size == ycat.size and wcat.size > 0:
-            df_rel_val = _reliability_table(
-                wcat, ycat,
-                mode=rel_mode, n_bins=rel_bins, min_count=rel_min_count
-            )
-            df_rel_val.to_csv(analysis_dir / "reliability_val.csv", index=False)
-
-            # keep original filename to avoid confusion
-            _plot_reliability(
-                df_rel_val,
-                title="Gate reliability on val (ties-aware) with 95% Wilson CI",
-                out_png=analysis_dir / "fig_gate_bins_val.png"
-            )
-
-    # figs
     if bool(ana_cfg.get("write_figs", True)) and len(df) > 0:
-        # tau / low_frac hist
+        wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
+        ycat = np.concatenate(all_y_val, axis=0) if all_y_val else np.zeros((0,), dtype=np.float32)
+
+        if wcat.size == ycat.size and wcat.size > 0:
+            _plot_reliability(
+                wcat, ycat,
+                out_path=analysis_dir / "fig_gate_bins_val.png",
+                title="Gate bins (reliability semantics, val)",
+                xlabel="wtil bin center",
+                nbins=10,
+                alpha=0.05,
+                min_count=1,
+            )
+
         plt.figure()
         plt.hist(df["tau"].values, bins=20)
         plt.xlabel("tau")
@@ -1271,10 +1106,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         plt.savefig(analysis_dir / "fig_lowfrac_hist.png", dpi=160)
         plt.close()
 
-        # feature hist (train, per-dim 1%-99% clipped) on RAW (before scaling)
         try:
             plt.figure()
-            Xh = X_tr_k_raw  # raw kept features
+            Xh = X_tr_k_raw
             for j in range(Xh.shape[1]):
                 x = Xh[:, j].astype(np.float64)
                 lo = float(np.quantile(x, 0.01))
