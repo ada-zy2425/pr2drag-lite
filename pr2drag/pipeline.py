@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import math
+import platform
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
 
@@ -181,9 +185,54 @@ def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
         "stage1": cfg.get("stage1", {}),
         "stage2": cfg.get("stage2", {}),
         "stage3": cfg.get("stage3", {}),
-        "version": "0.3.1-lite-risk-wcalib-tieaware+reliability_ci_fix",
+        "version": "0.3.1-lite-risk-wcalib-tieaware+reliability_ci_fix+oracle_segments_audit_v1",
     }
     return sha1_of_dict(pick)
+
+
+# ============================================================
+# Helpers (audit / robustness)
+# ============================================================
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _try_git_head() -> Optional[str]:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.STDOUT)
+        s = out.decode("utf-8", errors="ignore").strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _safe_quantile(x: np.ndarray, q: float, *, default: float = float("nan")) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return float(default)
+    return float(np.quantile(x, float(q)))
+
+
+def _segments_from_mask(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Return inclusive segments [t0, t1] where mask is True."""
+    m = np.asarray(mask, dtype=bool).reshape(-1)
+    n = int(m.size)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0, 0)] if bool(m[0]) else []
+    dm = np.diff(m.astype(np.int8))
+    starts = (np.where(dm == 1)[0] + 1).astype(int).tolist()
+    ends = np.where(dm == -1)[0].astype(int).tolist()
+    if bool(m[0]):
+        starts = [0] + starts
+    if bool(m[-1]):
+        ends = ends + [n - 1]
+    if len(starts) != len(ends):
+        # Should not happen, but guard anyway.
+        k = min(len(starts), len(ends))
+        starts, ends = starts[:k], ends[:k]
+    return list(zip(starts, ends))
 
 
 # ============================================================
@@ -460,7 +509,6 @@ def _binomial_ci_wilson(k: int, n: int, *, alpha: float = 0.05) -> Tuple[float, 
     hi = center + half
     lo = float(np.clip(lo, 0.0, 1.0))
     hi = float(np.clip(hi, 0.0, 1.0))
-    # enforce lo <= p <= hi (robust against tiny numeric issues)
     lo = min(lo, p)
     hi = max(hi, p)
     return lo, hi
@@ -511,7 +559,7 @@ def _reliability_bins(
             continue
 
         yy = y[m]
-        k = int(np.sum(yy >= 0.5))  # y is 0/1 in your case
+        k = int(np.sum(yy >= 0.5))
         p = float(k) / float(n)
         lo_ci, hi_ci = _binomial_ci_wilson(k, n, alpha=alpha)
 
@@ -547,20 +595,17 @@ def _plot_reliability(
     if x.size == 0:
         return
 
-    # sanitize (critical fix)
     p = np.clip(p, 0.0, 1.0)
     lo = np.clip(lo, 0.0, 1.0)
     hi = np.clip(hi, 0.0, 1.0)
 
-    # enforce lo <= p <= hi elementwise
     lo = np.minimum(lo, p)
     hi = np.maximum(hi, p)
 
     yerr_low = np.clip(p - lo, 0.0, np.inf)
     yerr_high = np.clip(hi - p, 0.0, np.inf)
-    yerr = np.vstack([yerr_low, yerr_high])  # shape (2, N)
+    yerr = np.vstack([yerr_low, yerr_high])
 
-    # filter non-finite just in case
     m = np.isfinite(x) & np.isfinite(p) & np.isfinite(yerr_low) & np.isfinite(yerr_high)
     x, p, yerr = x[m], p[m], yerr[:, m]
     if x.size == 0:
@@ -746,6 +791,23 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     out_dir = safe_mkdir(out_dir)
     analysis_dir = safe_mkdir(out_dir / "_analysis")
 
+    # --- run manifest (helps reproducibility / meeting)
+    try:
+        manifest = {
+            "time_utc": _now_utc_iso(),
+            "python": sys.version,
+            "platform": platform.platform(),
+            "argv": list(sys.argv),
+            "git_head": _try_git_head(),
+            "out_dir": str(out_dir),
+            "stage2_train": str(stage2_train),
+            "stage2_val": str(stage2_val),
+        }
+        write_json(analysis_dir / "run_manifest_v1.json", manifest)
+        write_json(analysis_dir / "config_resolved_v1.json", cfg)
+    except Exception as e:
+        print(f"[Warn] failed to write run manifest/config: {e}")
+
     s3 = cfg.get("stage3", {})
     hmm_cfg = s3.get("hmm", {})
     em_cfg = s3.get("emission", {})
@@ -771,6 +833,15 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     wc_enable = bool(wc_cfg.get("enable", False))
     wc_method = str(wc_cfg.get("method", "isotonic")).lower()
     wc_bins = int(wc_cfg.get("bins", 50))
+
+    # --- NEW: oracle reliability switch (for mechanism validation ONLY)
+    oracle_cfg = dict(s3.get("oracle", {}))
+    oracle_enable = bool(oracle_cfg.get("enable", False))
+    oracle_source = str(oracle_cfg.get("source", "y")).lower()  # y | err
+    oracle_tau = float(oracle_cfg.get("tau", 0.5))
+    oracle_err_px = float(oracle_cfg.get("err_px", met_cfg.get("fail_px", 50.0)))  # used when source=err
+    if oracle_enable:
+        print(f"[Oracle] enabled source={oracle_source} tau={oracle_tau} err_px={oracle_err_px}")
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -956,9 +1027,14 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         raise ValueError("Unknown tau_mode. Use: global | risk | per_video")
 
     rows = []
+    seg_rows: List[Dict[str, Any]] = []
     all_wtil_val = []
     all_err_obs_val = []
     all_y_val = []
+
+    # mismatch audit: (wtil < tau) vs (is_bridge|is_abst) should match
+    mismatch_total = 0
+    mismatch_frames_total = 0
 
     pbar = tqdm(sorted(Path(stage2_val).glob("*.npz")), desc="Stage3(val)")
     for npz_path in pbar:
@@ -987,8 +1063,94 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         else:
             raise ValueError(f"Unknown tau_mode={tau_mode}")
 
+        # --- NEW: oracle override (mechanism validation)
+        if oracle_enable:
+            if oracle_source == "y":
+                if y_seq.size != wtil.size:
+                    raise ValueError(f"[Oracle] y shape mismatch: y={y_seq.size} w={wtil.size} (seq={seq})")
+                wtil = y_seq.astype(np.float32)
+            elif oracle_source == "err":
+                # use provided err_obs if present; otherwise compute from z_obs/z_gt
+                if "err_obs" in arr and arr["err_obs"].size == wtil.size:
+                    err_obs_1d = arr["err_obs"].astype(np.float32).reshape(-1)
+                else:
+                    err_obs_1d = np.linalg.norm((z_obs - z_gt).astype(np.float64), axis=1).astype(np.float32)
+                wtil = (err_obs_1d < float(oracle_err_px)).astype(np.float32)
+            else:
+                raise ValueError(f"[Oracle] unknown source={oracle_source}, expected y|err")
+            tau = float(oracle_tau)
+
         seg_debug = [] if (debug_aob and seq in debug_seqs) else None
         z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=wtil, tau=tau, params=aobp, debug=seg_debug)
+
+        # --- NEW: segment-level audit table (one row per low segment)
+        low_by_tau = (wtil < float(tau))
+        low_by_aob = (is_bridge | is_abst)
+        if low_by_tau.shape != low_by_aob.shape:
+            raise ValueError(f"[Audit] mask shape mismatch for seq={seq}: {low_by_tau.shape} vs {low_by_aob.shape}")
+
+        if not np.array_equal(low_by_tau, low_by_aob):
+            mismatch_total += 1
+            mismatch_frames_total += int(np.sum(low_by_tau != low_by_aob))
+
+        segs = _segments_from_mask(low_by_tau)
+        if len(segs) > 0:
+            err_obs = np.linalg.norm((z_obs - z_gt).astype(np.float64), axis=1)
+            err_fin = np.linalg.norm((z_fin - z_gt).astype(np.float64), axis=1)
+
+            for seg_id, (t0, t1) in enumerate(segs):
+                L = int(t1 - t0 + 1)
+                b_n = int(np.sum(is_bridge[t0:t1 + 1]))
+                a_n = int(np.sum(is_abst[t0:t1 + 1]))
+                if b_n > 0 and a_n > 0:
+                    seg_type = "mixed"
+                elif b_n > 0:
+                    seg_type = "bridge"
+                elif a_n > 0:
+                    seg_type = "abstain"
+                else:
+                    seg_type = "none"  # should not happen
+
+                left = t0 - 1
+                right = t1 + 1
+                has_left = (left >= 0) and (not bool(low_by_tau[left]))
+                has_right = (right < int(wtil.size)) and (not bool(low_by_tau[right]))
+
+                if has_left and has_right:
+                    bd_obs = float(np.linalg.norm((z_obs[left] - z_obs[right]).astype(np.float64)))
+                    bd_fin = float(np.linalg.norm((z_fin[left] - z_fin[right]).astype(np.float64)))
+                else:
+                    bd_obs = float("nan")
+                    bd_fin = float("nan")
+
+                seg_err_obs = err_obs[t0:t1 + 1]
+                seg_err_fin = err_fin[t0:t1 + 1]
+                seg_fail_obs = float(np.mean(seg_err_obs > float(fail_px))) if seg_err_obs.size else float("nan")
+                seg_fail_fin = float(np.mean(seg_err_fin > float(fail_px))) if seg_err_fin.size else float("nan")
+
+                seg_rows.append({
+                    "seq": seq,
+                    "T": int(wtil.size),
+                    "tau": float(tau),
+                    "seg_id": int(seg_id),
+                    "t0": int(t0),
+                    "t1": int(t1),
+                    "L": int(L),
+                    "type": seg_type,
+                    "bridge_n": int(b_n),
+                    "abst_n": int(a_n),
+                    "has_left": int(has_left),
+                    "has_right": int(has_right),
+                    "boundary_disp_obs": bd_obs,
+                    "boundary_disp_fin": bd_fin,
+                    "w_min": float(np.min(wtil[t0:t1 + 1])) if L > 0 else float("nan"),
+                    "w_mean": float(np.mean(wtil[t0:t1 + 1])) if L > 0 else float("nan"),
+                    "p_mean": float(np.mean(p[t0:t1 + 1])) if L > 0 else float("nan"),
+                    "seg_obs_p95": _safe_quantile(seg_err_obs, 0.95),
+                    "seg_fin_p95": _safe_quantile(seg_err_fin, 0.95),
+                    "seg_obs_fail": seg_fail_obs,
+                    "seg_fin_fail": seg_fail_fin,
+                })
 
         if debug_aob and seq in debug_seqs:
             Tseq = int(len(wtil))
@@ -1016,12 +1178,14 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             write_json(analysis_dir / f"debug_aob_{seq}.json", {
                 "seq": seq,
                 "tau": float(tau),
+                "oracle": {"enable": oracle_enable, "source": oracle_source, "tau": oracle_tau, "err_px": oracle_err_px},
                 "aobp": {
                     "eps_gate": aobp.eps_gate,
                     "abstain_mode": aobp.abstain_mode,
                     "eta_L": aobp.eta_L,
                     "eta_u": aobp.eta_u,
                     "max_bridge_len": aobp.max_bridge_len,
+                    "bridge_mode": aobp.bridge_mode,
                 },
                 "wtil_quantiles": q,
                 "segments": seg_debug if seg_debug is not None else [],
@@ -1057,6 +1221,53 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         csv_path = analysis_dir / "table_v1.csv"
         df.to_csv(csv_path, index=False)
         print(f"[OK] wrote: {csv_path}")
+
+    # --- NEW: write segment audit csv
+    if bool(ana_cfg.get("write_csv", True)):
+        seg_df = pd.DataFrame(seg_rows)
+        seg_path = analysis_dir / "segments_v1.csv"
+        seg_df.to_csv(seg_path, index=False)
+        print(f"[OK] wrote: {seg_path}  num_segments={len(seg_df)}")
+
+        # small summary (useful for meeting)
+        if len(seg_df) > 0:
+            try:
+                seg_df2 = seg_df.copy()
+                # simple length buckets
+                seg_df2["L_bucket"] = pd.cut(
+                    seg_df2["L"].astype(float),
+                    bins=[0, 5, 15, 10_000],
+                    labels=["short(1-5)", "med(6-15)", "long(16+)"],
+                    include_lowest=True,
+                    right=True,
+                )
+                summ = (
+                    seg_df2
+                    .groupby(["type", "L_bucket"], dropna=False)
+                    .agg(
+                        n=("L", "count"),
+                        fin_p95=("seg_fin_p95", "mean"),
+                        fin_fail=("seg_fin_fail", "mean"),
+                        obs_p95=("seg_obs_p95", "mean"),
+                        obs_fail=("seg_obs_fail", "mean"),
+                        bd_obs=("boundary_disp_obs", "mean"),
+                    )
+                    .reset_index()
+                )
+                summ.to_csv(analysis_dir / "segments_summary_v1.csv", index=False)
+                print(f"[OK] wrote: {analysis_dir/'segments_summary_v1.csv'}")
+            except Exception as e:
+                print(f"[Warn] failed to write segments_summary_v1.csv: {e}")
+
+    if mismatch_total > 0:
+        print(f"[Audit] mismatch in {mismatch_total} seqs; mismatch_frames_total={mismatch_frames_total}")
+    try:
+        write_json(analysis_dir / "audit_mask_mismatch_v1.json", {
+            "mismatch_seqs": int(mismatch_total),
+            "mismatch_frames_total": int(mismatch_frames_total),
+        })
+    except Exception as e:
+        print(f"[Warn] failed to write audit_mask_mismatch_v1.json: {e}")
 
     try:
         from scipy.stats import spearmanr  # type: ignore
