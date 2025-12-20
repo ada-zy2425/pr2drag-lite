@@ -30,7 +30,7 @@ stage3:
 
   tau_target_frac: 0.10
   tau_mode: risk          # 关键：从 quantile 改为 risk-constrained
-  tau_risk: 0.05          # r0：信任帧中允许 5% 坏帧
+  tau_risk: 0.02
   tau_min_keep_frac: 0.05 # 至少保留 5% 帧，避免极端阈值把样本吃没
   tau_min: 1e-6
   tau_max: 0.999999
@@ -79,3 +79,5 @@ stage3:
   analysis:
     write_csv: true
     write_figs: true
+
+

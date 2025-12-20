@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import math
-import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
 
@@ -44,10 +44,12 @@ debug_seqs = set(
     s.strip()
     for s in os.environ.get(
         "PR2DRAG_DEBUG_AOB_SEQS",
-        "breakdance,horsejump-high,soapbox",
+        "breakdance,horsejump-high,soapbox"
     ).split(",")
     if s.strip()
 )
+
+debug_gate = os.environ.get("PR2DRAG_DEBUG_GATE", "0") == "1"
 
 
 # ============================================================
@@ -182,7 +184,7 @@ def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
         "stage1": cfg.get("stage1", {}),
         "stage2": cfg.get("stage2", {}),
         "stage3": cfg.get("stage3", {}),
-        "version": "0.3.2-lite-risk-wcalib-tieaware-policy-seedfix",
+        "version": "0.3.2-lite-risk-wcalib-tieaware-valdiag",
     }
     return sha1_of_dict(pick)
 
@@ -226,11 +228,7 @@ def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -
 
         seed = int(cfg.get("seed", 0))
         seed_offset = int(noise_cfg.get("seed_offset", 0))
-
-        # IMPORTANT: do NOT use Python's built-in hash(seq) for seeding.
-        # hash() is randomized per process unless PYTHONHASHSEED is fixed, breaking reproducibility.
-        seq_hash = int(hashlib.sha1(seq.encode("utf-8")).hexdigest()[:8], 16) % 10_000
-        rng = np.random.RandomState(seed + seed_offset + seq_hash)
+        rng = np.random.RandomState(seed + seed_offset + (abs(hash(seq)) % 10_000))
 
         ev = build_sequence_evidence(
             seq=seq,
@@ -310,9 +308,18 @@ def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, o
     sig = _stage_signature(cfg, stage=f"stage2-{split}-feat{feat_mode}")
 
     meta_path = stage1_dir / "meta.json"
+    seqs: List[str]
     if meta_path.exists():
-        meta = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
-        seqs = list(meta.get("seqs", []))
+        # robust json load (avoid pandas schema quirks)
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            seqs = list(meta.get("seqs", []))
+        except Exception:
+            try:
+                meta_pd = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
+                seqs = list(meta_pd.get("seqs", []))
+            except Exception:
+                seqs = sorted([p.stem for p in stage1_dir.glob("*.npz")])
     else:
         seqs = sorted([p.stem for p in stage1_dir.glob("*.npz")])
 
@@ -408,9 +415,7 @@ def _robust_iqr_apply(
     center = np.array(scaler.get("center", []), dtype=np.float64)
     scale = np.array(scaler.get("scale", []), dtype=np.float64)
     if center.size != X.shape[1] or scale.size != X.shape[1]:
-        raise ValueError(
-            f"[Scaler] shape mismatch: center/scale dims={center.size}/{scale.size} but X has {X.shape[1]} dims"
-        )
+        raise ValueError(f"[Scaler] shape mismatch: center/scale dims={center.size}/{scale.size} but X has {X.shape[1]} dims")
     Z = (X.astype(np.float64) - center[None, :]) / scale[None, :]
     if clip is not None:
         Z = np.clip(Z, -float(clip), float(clip))
@@ -460,7 +465,6 @@ class _WCalibrator:
         if self.method == "isotonic":
             try:
                 from sklearn.isotonic import IsotonicRegression  # type: ignore
-
                 iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
                 iso.fit(w, y)
                 self._iso = iso
@@ -471,7 +475,6 @@ class _WCalibrator:
                 print(f"[W-Calib] isotonic unavailable/failed ({e}) -> fallback to binning")
                 self.method = "binning"
 
-        # Binning calibration (monotone by cumulative max)
         bins = max(2, int(self.bins))
         qs = np.linspace(0.0, 1.0, bins + 1)
         edges = np.quantile(w, qs)
@@ -549,7 +552,6 @@ class _WCalibrator:
         if typ == "isotonic":
             try:
                 from sklearn.isotonic import IsotonicRegression  # type: ignore
-
                 iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
                 iso.X_thresholds_ = np.asarray(d.get("x", []), dtype=np.float64)
                 iso.y_thresholds_ = np.asarray(d.get("y", []), dtype=np.float64)
@@ -563,7 +565,158 @@ class _WCalibrator:
 
 
 # ============================================================
-# tau selection (tie-aware, kept={w>=tau}, with policy options)
+# Reliability utilities (Wilson CI + bins that respect ties)
+# ============================================================
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    """Wilson score interval for binomial proportion."""
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    phat = float(k) / float(n)
+    denom = 1.0 + (z * z) / float(n)
+    center = (phat + (z * z) / (2.0 * float(n))) / denom
+    half = (z / denom) * math.sqrt((phat * (1.0 - phat) / float(n)) + (z * z) / (4.0 * float(n) * float(n)))
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return lo, hi
+
+
+def _risk_coverage(w: np.ndarray, y: np.ndarray, *, tau: float) -> Dict[str, float]:
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.int64).reshape(-1)
+    n = int(w.size)
+    if n == 0 or y.size != n:
+        return {"tau": float(tau), "coverage": float("nan"), "risk": float("nan"), "kept_n": 0.0, "n": float(n)}
+    kept = (w >= float(tau))
+    kept_n = int(np.sum(kept))
+    cov = float(kept_n) / float(n)
+    if kept_n == 0:
+        risk = float("nan")
+    else:
+        risk = float(np.mean((1 - y[kept]).astype(np.float64)))
+    return {"tau": float(tau), "coverage": cov, "risk": risk, "kept_n": float(kept_n), "n": float(n)}
+
+
+def _reliability_table(
+    w: np.ndarray,
+    y: np.ndarray,
+    *,
+    mode: str = "auto",
+    n_bins: int = 10,
+    min_count: int = 20,
+) -> pd.DataFrame:
+    """
+    Build reliability table robust to ties.
+    - mode='unique': one point per unique w (sorted), with counts.
+    - mode='quantile': quantile bins (tries to avoid empty bins).
+    - mode='auto': unique if few unique levels else quantile.
+    """
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.int64).reshape(-1)
+    if w.size == 0 or y.size != w.size:
+        return pd.DataFrame(columns=["lo", "hi", "center", "count", "pos_rate", "ci_low", "ci_high"])
+
+    mode = str(mode).lower()
+    uniq = np.unique(w)
+    if mode == "auto":
+        # isotonic often creates few levels; in that case unique-level is the only honest plot
+        mode = "unique" if uniq.size <= max(30, 3 * int(n_bins)) else "quantile"
+
+    rows: List[Dict[str, float]] = []
+
+    if mode == "unique":
+        vals = np.sort(uniq)
+        for v in vals:
+            m = (w == v)
+            c = int(np.sum(m))
+            if c <= 0:
+                continue
+            k = int(np.sum(y[m] == 1))
+            pos = float(k) / float(c)
+            lo, hi = _wilson_ci(k, c)
+            rows.append(
+                {
+                    "lo": float(v),
+                    "hi": float(v),
+                    "center": float(v),
+                    "count": float(c),
+                    "pos_rate": pos,
+                    "ci_low": float(lo),
+                    "ci_high": float(hi),
+                }
+            )
+
+    elif mode == "quantile":
+        nb = max(2, int(n_bins))
+        qs = np.linspace(0.0, 1.0, nb + 1)
+        edges = np.quantile(w, qs)
+        edges = np.unique(edges)
+        if edges.size < 3:
+            # fallback to equal-width
+            edges = np.linspace(float(np.min(w)), float(np.max(w)), nb + 1)
+        for i in range(edges.size - 1):
+            lo_e, hi_e = float(edges[i]), float(edges[i + 1])
+            if i < edges.size - 2:
+                m = (w >= lo_e) & (w < hi_e)
+            else:
+                m = (w >= lo_e) & (w <= hi_e)
+            c = int(np.sum(m))
+            if c <= 0:
+                continue
+            if c < int(min_count):
+                # still keep it (don’t hide small bins), but CI will reflect uncertainty
+                pass
+            k = int(np.sum(y[m] == 1))
+            pos = float(k) / float(c)
+            ci_lo, ci_hi = _wilson_ci(k, c)
+            rows.append(
+                {
+                    "lo": lo_e,
+                    "hi": hi_e,
+                    "center": 0.5 * (lo_e + hi_e),
+                    "count": float(c),
+                    "pos_rate": pos,
+                    "ci_low": float(ci_lo),
+                    "ci_high": float(ci_hi),
+                }
+            )
+    else:
+        raise ValueError(f"[Reliability] unknown mode={mode}")
+
+    return pd.DataFrame(rows)
+
+
+def _plot_reliability(df_rel: pd.DataFrame, *, title: str, out_png: Path) -> None:
+    if df_rel is None or len(df_rel) == 0:
+        return
+    x = df_rel["center"].values.astype(np.float64)
+    y = df_rel["pos_rate"].values.astype(np.float64)
+    lo = df_rel["ci_low"].values.astype(np.float64)
+    hi = df_rel["ci_high"].values.astype(np.float64)
+    yerr = np.vstack([y - lo, hi - y])
+    plt.figure()
+    plt.errorbar(x, y, yerr=yerr, fmt="o-")
+    plt.xlabel("wtil (bin center)")
+    plt.ylabel("empirical P(y=1)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+
+def _dump_w_ties(w: np.ndarray, *, topk: int = 20) -> Dict[str, Any]:
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    if w.size == 0:
+        return {"n": 0, "unique": 0, "top": []}
+    vals, cnt = np.unique(w, return_counts=True)
+    idx = np.argsort(-cnt)
+    top = []
+    for i in idx[: int(topk)]:
+        top.append({"w": float(vals[i]), "count": int(cnt[i]), "frac": float(cnt[i]) / float(w.size)})
+    return {"n": int(w.size), "unique": int(vals.size), "top": top}
+
+
+# ============================================================
+# tau selection (tie-aware, consistent with kept={w>=tau})
 # ============================================================
 def _select_tau_risk_constrained_tieaware(
     w: np.ndarray,
@@ -577,54 +730,32 @@ def _select_tau_risk_constrained_tieaware(
     risk_margin: float = 0.0,
 ) -> Tuple[float, Dict[str, float], pd.DataFrame]:
     """
-    Tie-aware tau selection on kept set {w>=tau}.
-
-    Definitions:
-      risk     = P(y=0 | kept)
-      coverage = |kept| / n
-
-    Many calibrators (e.g., isotonic) produce many ties in w, so we only evaluate thresholds
-    at the end of each tie group to ensure kept={w>=tau} is consistent.
+    Tie-aware tau selection over kept set {w>=tau}.
+    risk = P(y=0 | kept), coverage = kept_frac.
 
     policy:
-      - "max_coverage": among feasible (risk<=r0), pick the one with max coverage (lowest tau).
-      - "max_tau": among feasible, pick the one with max tau (most conservative).
-      - "min_risk": among feasible, pick the minimal risk (break ties by higher coverage).
-      - "balanced": maximize coverage - alpha*risk (alpha ~ 1/r0).
-
-    risk_margin:
-      use effective constraint r_eff = max(0, r0 - risk_margin) to be slightly conservative.
+      - max_coverage: maximize coverage s.t. risk <= (r0 - risk_margin)
+      - min_risk: among ks>=min_keep, pick minimal risk (then maximal coverage tie-break)
     """
     w = np.asarray(w, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.int64).reshape(-1)
-    if w.size == 0 or y.size != w.size:
-        tau = clamp(0.5, tau_min, tau_max)
-        df = pd.DataFrame({"tau": [], "k": [], "coverage": [], "risk": []})
-        return tau, {"coverage": float("nan"), "risk": float("nan")}, df
-
-    # sanitize
-    m = np.isfinite(w)
-    w = w[m]
-    y = y[m]
     n = int(w.size)
-    if n == 0:
+    policy = str(policy).lower().strip()
+
+    if n == 0 or y.size != n:
         tau = clamp(0.5, tau_min, tau_max)
         df = pd.DataFrame({"tau": [], "k": [], "coverage": [], "risk": []})
         return tau, {"coverage": float("nan"), "risk": float("nan")}, df
-    w = np.clip(w, 0.0, 1.0)
 
-    # stable sort to make ties deterministic
-    idx = np.argsort(-w, kind="mergesort")  # desc
+    idx = np.argsort(-w)  # desc
     ws = w[idx]
     ys = y[idx]
-    bad = (ys == 0).astype(np.float64)
+    bad = 1 - ys  # 1 if y=0
+
     cum_bad = np.cumsum(bad, dtype=np.float64)
 
-    # group ends for ties in ws: end positions where value changes OR last element
-    if n == 1:
-        ends = np.array([0], dtype=np.int64)
-    else:
-        ends = np.concatenate([np.nonzero(np.diff(ws))[0], np.array([n - 1])]).astype(np.int64)
+    change = np.r_[ws[1:] != ws[:-1], True]
+    ends = np.where(change)[0]
 
     ks = (ends + 1).astype(np.int64)
     risks = (cum_bad[ends] / ks.astype(np.float64))
@@ -632,37 +763,34 @@ def _select_tau_risk_constrained_tieaware(
     taus = ws[ends]
 
     min_keep = max(1, int(math.ceil(float(min_keep_frac) * n)))
-    r_eff = max(0.0, float(r0) - float(risk_margin))
-    feasible = (ks >= min_keep) & (risks <= r_eff)
+    valid = (ks >= min_keep)
 
-    pol = str(policy).lower()
-    i_star: int
+    r_eff = float(r0) - float(risk_margin)
+    r_eff = max(0.0, r_eff)
+
+    feasible = valid & (risks <= r_eff)
 
     if np.any(feasible):
-        cand = np.where(feasible)[0]
-        if pol in ("max_coverage", "maxcov"):
-            i_star = int(cand[np.argmax(covs[cand])])  # largest coverage (lowest tau)
-        elif pol in ("max_tau", "maxtau", "conservative"):
-            i_star = int(cand.min())  # highest tau among feasible
-        elif pol in ("min_risk", "minrisk"):
-            rr = risks[cand]
-            cc = covs[cand]
-            j = int(np.lexsort((-cc, rr))[0])  # min risk, then max coverage
-            i_star = int(cand[j])
-        elif pol in ("balanced", "pareto"):
-            alpha = 1.0 / max(float(r0), 1e-12)
-            score = covs[cand] - alpha * risks[cand]
-            i_star = int(cand[np.argmax(score)])
+        if policy == "min_risk":
+            rr = risks[feasible]
+            cc = covs[feasible]
+            ii = np.where(feasible)[0]
+            # pick minimal risk; tie-break by max coverage
+            rmin = float(np.min(rr))
+            cand = ii[np.where(rr == rmin)[0]]
+            i_star = int(cand[np.argmax(cc[np.where(rr == rmin)[0]])])
         else:
-            raise ValueError(f"Unknown tau policy: {policy}. Use max_coverage|max_tau|min_risk|balanced.")
+            # default: max coverage among feasible
+            i_star = int(np.where(feasible)[0].max())
     else:
-        valid = ks >= min_keep
+        # fallback: among valid, pick minimal risk (then max coverage)
         if np.any(valid):
-            cand = np.where(valid)[0]
-            rr = risks[cand]
-            cc = covs[cand]
-            j = int(np.lexsort((-cc, rr))[0])
-            i_star = int(cand[j])
+            rr = risks[valid]
+            cc = covs[valid]
+            ii = np.where(valid)[0]
+            rmin = float(np.min(rr))
+            cand = ii[np.where(rr == rmin)[0]]
+            i_star = int(cand[np.argmax(cc[np.where(rr == rmin)[0]])])
         else:
             i_star = 0
 
@@ -678,11 +806,15 @@ def _select_tau_risk_constrained_tieaware(
         "min_keep": float(min_keep),
         "r0": float(r0),
         "r_eff": float(r_eff),
-        "policy": str(pol),
+        "policy": float("nan"),  # overwritten below
         "tau_raw": float(tau_raw),
         "tau_clamped": float(tau),
         "risk_margin": float(risk_margin),
+        "min_keep_frac": float(min_keep_frac),
     }
+    # store policy as string-ish via json later; keep float here for type-compat, but we will write dict properly upstream
+    # (we return summary as Dict[str,float] for historical reasons)
+    # caller will re-pack a richer dict with policy string.
     return tau, summary, df
 
 
@@ -708,7 +840,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     # risk-constrained tau config
     r0 = float(s3.get("tau_risk", 0.05))
     min_keep_frac = float(s3.get("tau_min_keep_frac", 0.05))
-    tau_policy = str(s3.get("tau_policy", "max_coverage")).lower()
+    tau_risk_policy = str(s3.get("tau_risk_policy", "max_coverage")).lower()
     tau_risk_margin = float(s3.get("tau_risk_margin", 0.0))
 
     # feature scaling
@@ -723,6 +855,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     wc_enable = bool(wc_cfg.get("enable", False))
     wc_method = str(wc_cfg.get("method", "isotonic")).lower()
     wc_bins = int(wc_cfg.get("bins", 50))
+
+    # reliability plot config
+    rel_cfg = dict(s3.get("reliability", {}))
+    rel_mode = str(rel_cfg.get("mode", "auto")).lower()  # auto|unique|quantile
+    rel_bins = int(rel_cfg.get("bins", 10))
+    rel_min_count = int(rel_cfg.get("min_count", 20))
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -778,10 +916,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         X_tr_k = _robust_iqr_apply(X_tr_k_raw, scaler, clip=sc_clip)
         X_va_k = _robust_iqr_apply(X_va_k_raw, scaler, clip=sc_clip)
         scaler_dump = {**scaler, "clip": float(sc_clip), "keep_mask": keep.astype(int).tolist()}
-        try:
-            write_json(analysis_dir / "feature_scaler.json", scaler_dump)
-        except Exception as e:
-            print(f"[Warn] failed to write feature_scaler.json: {e}")
+        write_json(analysis_dir / "feature_scaler.json", scaler_dump)
         print(f"[Feat] robust scaling enabled (clip={sc_clip}) -> wrote scaler to _analysis/feature_scaler.json")
     else:
         X_tr_k, X_va_k = X_tr_k_raw, X_va_k_raw
@@ -791,10 +926,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     # emission model
     # -----------------
     clf = fit_emission_model(
-        X_tr_k,
-        y_tr,
+        X_tr_k, y_tr,
         c=float(em_cfg.get("c", 1.0)),
-        max_iter=int(em_cfg.get("max_iter", 2000)),
+        max_iter=int(em_cfg.get("max_iter", 2000))
     )
 
     p_tr_raw = clf.predict_proba(X_tr_k)[:, 1].astype(np.float32)
@@ -836,7 +970,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     # w calibration: fit on TRAIN (w_raw -> wtil)
     # -----------------
     wcal: Optional[_WCalibrator] = None
-    wtil_tr_all: Optional[np.ndarray] = None
 
     if wc_enable:
         ws, ys = [], []
@@ -854,34 +987,26 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             wcal = _WCalibrator(method=wc_method, bins=wc_bins)
             wcal.fit(w_all, y_all)
             wtil_tr_all = wcal.transform(w_all)
-            try:
-                write_json(analysis_dir / "w_calibrator.json", wcal.to_dict())
-            except Exception as e:
-                print(f"[Warn] failed to write w_calibrator.json: {e}")
+            write_json(analysis_dir / "w_calibrator.json", wcal.to_dict())
             print(f"[W-Calib] enabled method={wc_method} bins={wc_bins}")
+
+            # diagnose ties (train)
+            if debug_gate:
+                write_json(analysis_dir / "debug_wtil_ties_train.json", _dump_w_ties(wtil_tr_all))
 
             # reliability curve on TRAIN after w calibration
             if bool(ana_cfg.get("write_figs", True)):
-                bins = np.linspace(0.0, 1.0, 11)
-                xs, accs = [], []
-                for i in range(10):
-                    lo, hi = bins[i], bins[i + 1]
-                    msk = (wtil_tr_all >= lo) & (wtil_tr_all < hi) if i < 9 else (wtil_tr_all >= lo) & (wtil_tr_all <= hi)
-                    if int(msk.sum()) == 0:
-                        continue
-                    xs.append(0.5 * (lo + hi))
-                    accs.append(float(y_all[msk].mean()))
-                if len(xs) > 0:
-                    plt.figure()
-                    plt.plot(xs, accs, marker="o")
-                    plt.xlabel("wtil bin center (calibrated)")
-                    plt.ylabel("empirical P(y=1)")
-                    plt.title("Reliability curve on train (after w calibration)")
-                    plt.tight_layout()
-                    plt.savefig(analysis_dir / "fig_reliability_train_wcalib.png", dpi=160)
-                    plt.close()
+                df_rel_tr = _reliability_table(
+                    wtil_tr_all, y_all,
+                    mode=rel_mode, n_bins=rel_bins, min_count=rel_min_count
+                )
+                df_rel_tr.to_csv(analysis_dir / "reliability_train_wcalib.csv", index=False)
+                _plot_reliability(
+                    df_rel_tr,
+                    title="Reliability (train, after w calibration) with 95% Wilson CI",
+                    out_png=analysis_dir / "fig_reliability_train_wcalib.png"
+                )
 
-    # apply (or identity) mapping
     def _w_to_wtil(w_raw: np.ndarray) -> np.ndarray:
         if wc_enable and wcal is not None:
             return wcal.transform(w_raw)
@@ -891,9 +1016,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     # tau selection (global)
     # -----------------
     tau_global: float = 0.5
+    tau_summary_train: Dict[str, Any] = {}
 
     if tau_mode == "global":
-        # quantile on TRAIN wtil
         ws = []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
             w_raw, _p, _y = _seq_post_w_raw(pth)
@@ -905,9 +1030,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             tau_global = float(np.quantile(w_all.astype(np.float64), target_frac))
             tau_global = clamp(tau_global, tau_min, tau_max)
         print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
+        tau_summary_train = {"policy": "quantile", "target_frac": float(target_frac), "tau": float(tau_global)}
 
     elif tau_mode == "risk":
-        # risk-constrained on TRAIN wtil (tie-aware + policy)
         ws, ys = [], []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
             w_raw, _p, y = _seq_post_w_raw(pth)
@@ -916,40 +1041,48 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
         y_all = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
 
-        tau_global, summ, curve = _select_tau_risk_constrained_tieaware(
-            w_all,
-            y_all,
+        tau_global, summ_float, curve = _select_tau_risk_constrained_tieaware(
+            w_all, y_all,
             r0=r0,
             min_keep_frac=min_keep_frac,
             tau_min=tau_min,
             tau_max=tau_max,
-            policy=tau_policy,
+            policy=tau_risk_policy,
             risk_margin=tau_risk_margin,
         )
 
+        # recompute exact train gate stats under the final tau (ground truth)
+        gate_tr = _risk_coverage(w_all, y_all, tau=tau_global)
+
         print(
-            f"[Tau] risk-constrained({tau_policy}): tau_global={tau_global:.6f}  "
-            f"coverage={summ.get('coverage', float('nan')):.3f}  risk={summ.get('risk', float('nan')):.3f}  "
+            f"[Tau] risk-constrained({tau_risk_policy}): tau_global={tau_global:.6f}  "
+            f"coverage={gate_tr['coverage']:.3f}  risk={gate_tr['risk']:.3f}  "
             f"r0={r0} margin={tau_risk_margin}"
         )
 
-        # save curve/summary
-        try:
-            curve.to_csv(analysis_dir / "tau_risk_curve_train.csv", index=False)
-        except Exception as e:
-            print(f"[Warn] failed to write tau_risk_curve_train.csv: {e}")
-        try:
-            write_json(
-                analysis_dir / "tau_risk_summary_train.json",
-                {**summ, "tau": float(tau_global), "min_keep_frac": float(min_keep_frac)},
-            )
-        except Exception as e:
-            print(f"[Warn] failed to write tau_risk_summary_train.json: {e}")
+        curve.to_csv(analysis_dir / "tau_risk_curve_train.csv", index=False)
+
+        tau_summary_train = {
+            "coverage": gate_tr["coverage"],
+            "risk": gate_tr["risk"],
+            "k": gate_tr["kept_n"],
+            "n": gate_tr["n"],
+            "min_keep": float(max(1, int(math.ceil(min_keep_frac * float(gate_tr["n"]))))),
+            "r0": float(r0),
+            "r_eff": float(max(0.0, float(r0) - float(tau_risk_margin))),
+            "policy": str(tau_risk_policy),
+            "tau_raw": float(summ_float.get("tau_raw", tau_global)),
+            "tau_clamped": float(tau_global),
+            "risk_margin": float(tau_risk_margin),
+            "tau": float(tau_global),
+            "min_keep_frac": float(min_keep_frac),
+        }
+        write_json(analysis_dir / "tau_risk_summary_train.json", tau_summary_train)
 
         if bool(ana_cfg.get("write_figs", True)) and len(curve) > 0:
             plt.figure()
             plt.plot(curve["coverage"].values, curve["risk"].values)
-            plt.axhline(float(r0), linestyle="--")
+            plt.axhline(max(0.0, float(r0) - float(tau_risk_margin)), linestyle="--")
             plt.xlabel("coverage (kept fraction)")
             plt.ylabel("risk (P(y=0 | kept))")
             plt.title("Coverage–Risk curve (train, tie-aware)")
@@ -1024,25 +1157,19 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     f"err_obs_p95_low={_q95(err_obs[low_mask]):.3f} err_fin_p95_low={_q95(err_fin[low_mask]):.3f}"
                 )
 
-            try:
-                write_json(
-                    analysis_dir / f"debug_aob_{seq}.json",
-                    {
-                        "seq": seq,
-                        "tau": float(tau),
-                        "aobp": {
-                            "eps_gate": aobp.eps_gate,
-                            "abstain_mode": aobp.abstain_mode,
-                            "eta_L": aobp.eta_L,
-                            "eta_u": aobp.eta_u,
-                            "max_bridge_len": aobp.max_bridge_len,
-                        },
-                        "wtil_quantiles": q,
-                        "segments": seg_debug if seg_debug is not None else [],
-                    },
-                )
-            except Exception as e:
-                print(f"[Warn] failed to write debug json for {seq}: {e}")
+            write_json(analysis_dir / f"debug_aob_{seq}.json", {
+                "seq": seq,
+                "tau": float(tau),
+                "aobp": {
+                    "eps_gate": aobp.eps_gate,
+                    "abstain_mode": aobp.abstain_mode,
+                    "eta_L": aobp.eta_L,
+                    "eta_u": aobp.eta_u,
+                    "max_bridge_len": aobp.max_bridge_len,
+                },
+                "wtil_quantiles": q,
+                "segments": seg_debug if seg_debug is not None else [],
+            })
 
         sm = compute_seq_metrics(
             seq=seq,
@@ -1059,7 +1186,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
         all_wtil_val.append(wtil)
         all_err_obs_val.append(arr.get("err_obs", np.zeros((wtil.shape[0],), dtype=np.float32)).astype(np.float32))
-        all_y_val.append(y_seq.astype(np.float32))
+        all_y_val.append(y_seq.astype(np.uint8))
 
     df = pd.DataFrame(rows)
     if len(df) > 0:
@@ -1078,7 +1205,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     # correlation spearman(wtil, -err)
     try:
         from scipy.stats import spearmanr  # type: ignore
-
         wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
         ecat = np.concatenate(all_err_obs_val, axis=0) if all_err_obs_val else np.zeros((0,), dtype=np.float32)
         if wcat.size > 10 and ecat.size == wcat.size:
@@ -1092,32 +1218,40 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     print(f"[OK] wrote stage3 to: {out_dir}")
     print(f"  spearman(wtil, -err_obs) = {rho}")
 
+    # -----------------
+    # Gate diagnostics on VAL (same semantics as TRAIN)
+    # -----------------
+    if bool(ana_cfg.get("write_csv", True)) or bool(ana_cfg.get("write_figs", True)):
+        wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
+        ycat = np.concatenate(all_y_val, axis=0) if all_y_val else np.zeros((0,), dtype=np.uint8)
+
+        # ties on val
+        if debug_gate and wcat.size > 0:
+            write_json(analysis_dir / "debug_wtil_ties_val.json", _dump_w_ties(wcat))
+
+        # val gate risk/coverage (IMPORTANT: not just train)
+        if tau_mode in ("global", "risk"):
+            gate_val = _risk_coverage(wcat, ycat, tau=float(tau_global))
+            print(f"[Val gate] tau={gate_val['tau']:.6f}  coverage={gate_val['coverage']:.3f}  risk={gate_val['risk']:.3f}  kept_n={int(gate_val['kept_n'])}/{int(gate_val['n'])}")
+            write_json(analysis_dir / "val_gate_summary.json", gate_val)
+
+        # reliability (val)
+        if bool(ana_cfg.get("write_figs", True)) and wcat.size == ycat.size and wcat.size > 0:
+            df_rel_val = _reliability_table(
+                wcat, ycat,
+                mode=rel_mode, n_bins=rel_bins, min_count=rel_min_count
+            )
+            df_rel_val.to_csv(analysis_dir / "reliability_val.csv", index=False)
+
+            # keep original filename to avoid confusion
+            _plot_reliability(
+                df_rel_val,
+                title="Gate reliability on val (ties-aware) with 95% Wilson CI",
+                out_png=analysis_dir / "fig_gate_bins_val.png"
+            )
+
     # figs
     if bool(ana_cfg.get("write_figs", True)) and len(df) > 0:
-        wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
-        ycat = np.concatenate(all_y_val, axis=0) if all_y_val else np.zeros((0,), dtype=np.float32)
-
-        # gate bins on VAL
-        if wcat.size == ycat.size and wcat.size > 0:
-            bins = np.linspace(0.0, 1.0, 11)
-            xs, accs = [], []
-            for i in range(10):
-                lo, hi = bins[i], bins[i + 1]
-                msk = (wcat >= lo) & (wcat < hi) if i < 9 else (wcat >= lo) & (wcat <= hi)
-                if int(msk.sum()) == 0:
-                    continue
-                xs.append(0.5 * (lo + hi))
-                accs.append(float(ycat[msk].mean()))
-            if len(xs) > 0:
-                plt.figure()
-                plt.plot(xs, accs, marker="o")
-                plt.xlabel("wtil bin center")
-                plt.ylabel("empirical P(y=1)")
-                plt.title("Gate bins (reliability semantics, val)")
-                plt.tight_layout()
-                plt.savefig(analysis_dir / "fig_gate_bins_val.png", dpi=160)
-                plt.close()
-
         # tau / low_frac hist
         plt.figure()
         plt.hist(df["tau"].values, bins=20)
@@ -1174,17 +1308,12 @@ def run_all(cfg: Dict[str, Any]) -> None:
 
     out_dir_s3 = base_out / cfg.get("stage3", {}).get("out_dir", "davis2016_stage3_fixed")
 
-    print(
-        pretty_header(
-            "PR2-Drag Lite",
-            {
-                "cmd": "run_all",
-                "davis_root": str(davis_root),
-                "res": res,
-                "base_out": str(base_out),
-            },
-        )
-    )
+    print(pretty_header("PR2-Drag Lite", {
+        "cmd": "run_all",
+        "davis_root": str(davis_root),
+        "res": res,
+        "base_out": str(base_out),
+    }))
 
     meta_tr = stage1_precompute_split(cfg, split="train", out_dir=out_train_s1)
     print(f"[OK] Stage1(train) meta: {out_train_s1/'meta.json'}")
@@ -1196,9 +1325,6 @@ def run_all(cfg: Dict[str, Any]) -> None:
 
     stage2_compute_split(cfg, split="train", stage1_dir=out_train_s1, out_dir=out_train_s2)
     stage2_compute_split(cfg, split="val", stage1_dir=out_val_s1, out_dir=out_val_s2)
-    print(
-        f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} "
-        f"val_npz= {len(list(out_val_s2.glob('*.npz')))}"
-    )
+    print(f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} val_npz= {len(list(out_val_s2.glob('*.npz')))}")
 
     stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)
