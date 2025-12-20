@@ -1,0 +1,77 @@
+exp_name: "davis2016_stage3_fixed"
+
+paths:
+  davis_root: "/content/drive/MyDrive/DAVIS_unzipped/DAVIS"
+  base_out: "/content/drive/MyDrive/pr2drag_data"
+
+res: "480p"
+
+splits:
+  train: "ImageSets/480p/train.txt"
+  val: "ImageSets/480p/val.txt"
+
+# -------- Stage1 (precompute) --------
+stage1:
+  out_train: "davis2016_train_precompute"
+  out_val: "davis2016_val_precompute"
+
+  # A/B evidence features
+  feat_set: "b"           # "a" (5-d) or "b" (7-d)
+
+  # simple propagation by phase correlation (global shift); robust CPU baseline
+  phasecorr:
+    use_hann: true
+    eps: 1.0e-9
+
+# -------- Stage2 (dataset build) --------
+stage2:
+  out_train: "davis2016_train_stage2"
+  out_val: "davis2016_val_stage2"
+
+  # labels: chi=1 (usable) if err_obs <= thresh
+  label:
+    mode: "quantile"      # "fixed" or "quantile"
+    fixed_err_thresh: 30.0
+    q_pos: 0.455          # roughly match your logs' pos_rate
+
+# -------- Stage3 (SP + AoB + analysis) --------
+stage3:
+  out_dir: "davis2016_stage3_fixed"
+
+  emission:
+    model: "logreg"
+    C: 1.0
+    max_iter: 2000
+    class_weight: "balanced"
+    calibrate:
+      enabled: true
+      method: "isotonic"    # "isotonic" or "none"
+
+  hmm:
+    A00: 0.95
+    A01: 0.05
+    A10: 0.05
+    A11: 0.95
+    pi0: 0.5
+    pi1: 0.5
+
+  tau:
+    mode: "global_quantile"
+    target_frac: 0.25       # low-reliability fraction on train
+
+  # AoB
+  aob:
+    eps_gate: 1.0           # 1.0 -> pure abstain control (bridge OFF)
+    abstain_mode: "linear"  # "hold" or "linear"
+    eta_L: 0.12
+    eta_u: 1.0
+    bridge:
+      enabled: true         # will be auto-disabled if eps_gate>=1.0
+      lambda_accel: 1.0     # acceleration prior strength
+
+  eval:
+    fail_err_thresh: 50.0   # error threshold for "fail rate" (pixels)
+
+  analysis:
+    make_plots: true
+    bins: 10

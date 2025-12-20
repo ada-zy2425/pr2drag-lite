@@ -1,0 +1,19 @@
+abstain_hold_pure:
+  stage3:
+    aob:
+      eps_gate: 1.0
+      abstain_mode: "hold"
+
+abstain_linear_pure:
+  stage3:
+    aob:
+      eps_gate: 1.0
+      abstain_mode: "linear"
+
+bridge_enabled_default:
+  stage3:
+    aob:
+      eps_gate: 0.2
+      abstain_mode: "linear"
+      bridge:
+        enabled: true
