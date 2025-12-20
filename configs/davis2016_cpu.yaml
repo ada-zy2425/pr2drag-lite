@@ -28,17 +28,18 @@ stage2:
 stage3:
   out_dir: "davis2016_stage3_fixed"
 
-  # tau selection
-  tau_mode: "global"        # "global" | "per_video"
-  tau_target_frac: 0.25
-  tau_min: 1.0e-6
+  tau_target_frac: 0.10
+  tau_mode: risk          # 关键：从 quantile 改为 risk-constrained
+  tau_risk: 0.05          # r0：信任帧中允许 5% 坏帧
+  tau_min_keep_frac: 0.05 # 至少保留 5% 帧，避免极端阈值把样本吃没
+  tau_min: 1e-6
   tau_max: 0.999999
 
   hmm:
     prior_good: 0.85
     p_stay_good: 0.92
     p_stay_bad: 0.92
-    eps: 1.0e-12
+    eps: 1e-3  
 
   emission:
     # logistic regression
@@ -46,11 +47,11 @@ stage3:
     max_iter: 2000
 
   aob:
-    eps_gate: 0.5           # set 1.0 => always abstain (bridge disabled)
-    abstain_mode: "hold"    # "hold" | "linear"
-    eta_L: 0.18
-    eta_u: 0.65
-    max_bridge_len: 20
+    abstain_mode: linear   # 比 hold 对持续运动更稳
+    max_bridge_len: 40     # 给 bridge 机会
+    eps_gate: 0.1          # 大幅降低门槛
+    eta_L: 0.05            # 长度惩罚减弱（关键）
+    eta_u: 0.65            # 先不动也行
 
   metrics:
     fail_px: 50.0
@@ -58,3 +59,4 @@ stage3:
   analysis:
     write_csv: true
     write_figs: true
+
