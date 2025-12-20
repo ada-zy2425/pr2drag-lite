@@ -35,6 +35,12 @@ stage3:
   tau_min: 1e-6
   tau_max: 0.999999
 
+  w_calibration:
+    enable: true
+    method: isotonic
+    bins: 50
+
+
   hmm:
     prior_good: 0.85
     p_stay_good: 0.92
@@ -42,6 +48,9 @@ stage3:
     eps: 1e-3  
 
   emission:
+    scaler:
+      enable: true
+      clip: 8.0
     calibration:
       enable: true
       eps: 1e-6

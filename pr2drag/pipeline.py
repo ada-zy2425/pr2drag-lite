@@ -1,18 +1,21 @@
 # pr2drag/pipeline.py
 from __future__ import annotations
+
 import os
+
 debug_aob = os.environ.get("PR2DRAG_DEBUG_AOB", "0") == "1"
 debug_seqs = set(
-    s.strip() for s in os.environ.get(
+    s.strip()
+    for s in os.environ.get(
         "PR2DRAG_DEBUG_AOB_SEQS",
-        "breakdance,horsejump-high,soapbox"
-    ).split(",") if s.strip()
+        "breakdance,horsejump-high,soapbox",
+    ).split(",")
+    if s.strip()
 )
-
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -44,6 +47,9 @@ from .utils import (
 )
 
 
+# -----------------------------
+# DAVIS helpers
+# -----------------------------
 def _resolve_davis_root(davis_root: Union[str, Path]) -> Path:
     p = Path(davis_root).expanduser()
     if str(p).strip() == "":
@@ -108,9 +114,7 @@ def _list_seq_from_split(davis_root: Path, split_rel: str) -> List[str]:
             seen.add(seq)
             seqs.append(seq)
 
-    print(
-        f"[SplitParse] split={split_path} num_lines={len(lines)} num_seqs(dedup)={len(seqs)} bad_lines={bad}"
-    )
+    print(f"[SplitParse] split={split_path} num_lines={len(lines)} num_seqs(dedup)={len(seqs)} bad_lines={bad}")
     if len(seqs) == 0:
         raise RuntimeError(f"[DAVIS] No valid sequences parsed from split file: {split_path}")
     return seqs
@@ -165,6 +169,9 @@ def davis_frame_paths(davis_root: Union[str, Path], res: str, seq: str) -> Tuple
     return frames, annos
 
 
+# -----------------------------
+# stage signatures
+# -----------------------------
 def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
     pick = {
         "stage": stage,
@@ -172,11 +179,14 @@ def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
         "stage1": cfg.get("stage1", {}),
         "stage2": cfg.get("stage2", {}),
         "stage3": cfg.get("stage3", {}),
-        "version": "0.3.0-lite-risk",
+        "version": "0.3.1-lite-risk-calib-scale",
     }
     return sha1_of_dict(pick)
 
 
+# -----------------------------
+# Stage 1
+# -----------------------------
 def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -> Dict[str, Any]:
     davis_root = resolve_davis_root(cfg["davis_root"])
     res = cfg["res"]
@@ -254,6 +264,9 @@ def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -
     return meta
 
 
+# -----------------------------
+# Stage 2
+# -----------------------------
 def stage2_build_features_for_seq(arr: Dict[str, np.ndarray], *, feat_mode: str) -> np.ndarray:
     iou_shift = arr["iou_shift"].astype(np.float32)
     cycle_err = arr["cycle_err"].astype(np.float32)
@@ -352,11 +365,162 @@ def _feature_keep_mask(X: np.ndarray) -> np.ndarray:
     std = X.std(axis=0)
     keep = std > 1e-12
     if not bool(keep.any()):
-        # fallback: keep all (avoid empty feature vector)
         keep[:] = True
     return keep
 
 
+# -----------------------------
+# Scaling / calibration helpers
+# -----------------------------
+def _clip_probs(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    p = np.asarray(p, dtype=np.float32)
+    return np.clip(p, eps, 1.0 - eps)
+
+
+def _fit_robust_scaler(
+    X: np.ndarray,
+    *,
+    eps: float = 1e-6,
+    clip: Optional[float] = 8.0,
+) -> Dict[str, Any]:
+    """
+    Robust scaling: (x - median) / IQR, with optional symmetric clip.
+    Returns a dict usable by _apply_robust_scaler.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.shape[0] == 0:
+        # degenerate
+        d = int(X.shape[1]) if X.ndim == 2 else 1
+        return {"center": np.zeros((d,), np.float32), "scale": np.ones((d,), np.float32), "clip": clip, "eps": eps}
+
+    center = np.median(X, axis=0).astype(np.float32)
+    q25 = np.percentile(X, 25.0, axis=0).astype(np.float32)
+    q75 = np.percentile(X, 75.0, axis=0).astype(np.float32)
+    scale = (q75 - q25).astype(np.float32)
+    scale = np.where(scale < eps, 1.0, scale).astype(np.float32)
+
+    return {"center": center, "scale": scale, "clip": clip, "eps": eps}
+
+
+def _apply_robust_scaler(X: np.ndarray, scaler: Dict[str, Any]) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    center = np.asarray(scaler["center"], dtype=np.float32)
+    scale = np.asarray(scaler["scale"], dtype=np.float32)
+    clipv = scaler.get("clip", None)
+
+    Z = (X - center[None, :]) / scale[None, :]
+    if clipv is not None:
+        Z = np.clip(Z, -float(clipv), float(clipv))
+    return Z.astype(np.float32)
+
+
+class _PiecewiseMonotoneCalibrator:
+    """
+    A lightweight monotone calibrator fallback (no sklearn):
+    - bin w into quantile bins
+    - compute empirical P(y=1) per bin
+    - apply PAV-like monotone correction (pool-adjacent-violators)
+    """
+    def __init__(self, edges: np.ndarray, values: np.ndarray):
+        self.edges = np.asarray(edges, dtype=np.float64)
+        self.values = np.asarray(values, dtype=np.float64)
+
+    def __call__(self, w: np.ndarray) -> np.ndarray:
+        w = np.asarray(w, dtype=np.float64)
+        # bins: [edges[i], edges[i+1])
+        idx = np.searchsorted(self.edges[1:-1], w, side="right")
+        out = self.values[idx]
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _fit_w_calibrator(
+    w_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    method: str = "isotonic",
+    n_bins: int = 50,
+) -> Callable[[np.ndarray], np.ndarray]:
+    w_train = np.asarray(w_train, dtype=np.float64).reshape(-1)
+    y_train = np.asarray(y_train, dtype=np.float64).reshape(-1)
+    m = np.isfinite(w_train) & np.isfinite(y_train)
+    w_train = np.clip(w_train[m], 0.0, 1.0)
+    y_train = np.clip(y_train[m], 0.0, 1.0)
+
+    if w_train.size < 100:
+        # too small -> identity
+        return lambda w: np.clip(np.asarray(w, dtype=np.float32), 0.0, 1.0)
+
+    method = str(method).lower()
+    if method == "isotonic":
+        try:
+            from sklearn.isotonic import IsotonicRegression  # type: ignore
+            iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+            iso.fit(w_train, y_train)
+            return lambda w: iso.predict(np.clip(np.asarray(w, dtype=np.float64), 0.0, 1.0)).astype(np.float32)
+        except Exception:
+            method = "piecewise"
+
+    # piecewise fallback
+    qs = np.linspace(0.0, 1.0, n_bins + 1)
+    edges = np.quantile(w_train, qs)
+    # ensure strictly increasing edges (avoid zero-width bins)
+    edges[0] = 0.0
+    edges[-1] = 1.0
+    for i in range(1, len(edges)):
+        if edges[i] < edges[i - 1]:
+            edges[i] = edges[i - 1]
+
+    # compute bin means
+    vals = []
+    counts = []
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        if i < n_bins - 1:
+            mask = (w_train >= lo) & (w_train < hi)
+        else:
+            mask = (w_train >= lo) & (w_train <= hi)
+        if mask.sum() == 0:
+            vals.append(0.0)
+            counts.append(0)
+        else:
+            vals.append(float(y_train[mask].mean()))
+            counts.append(int(mask.sum()))
+    vals = np.asarray(vals, dtype=np.float64)
+    counts = np.asarray(counts, dtype=np.int64)
+
+    # PAV monotone correction
+    v = vals.copy()
+    c = counts.astype(np.float64).copy()
+    i = 0
+    while i < len(v) - 1:
+        if v[i] <= v[i + 1] or (c[i] == 0 and c[i + 1] == 0):
+            i += 1
+            continue
+        # pool i and i+1
+        tot = c[i] + c[i + 1]
+        if tot <= 0:
+            newv = max(v[i], v[i + 1])
+        else:
+            newv = (v[i] * c[i] + v[i + 1] * c[i + 1]) / tot
+        v[i] = newv
+        c[i] = tot
+        v = np.delete(v, i + 1)
+        c = np.delete(c, i + 1)
+        # also merge edges by removing one boundary (keep length consistent by rebuilding later)
+        # simplest: break and rebuild a calibrator with uniform bin indexing
+        # -> we skip complex edge merging; instead enforce monotone by cumulative maximum as a safe fallback
+        # (still monotone, less sharp but stable)
+        break
+
+    if len(v) != len(vals):
+        v = np.maximum.accumulate(vals)
+
+    return _PiecewiseMonotoneCalibrator(edges=np.asarray(edges, dtype=np.float64), values=v)
+
+
+# -----------------------------
+# Risk-constrained tau (tie-aware)
+# -----------------------------
 def _select_tau_risk_constrained(
     w: np.ndarray,
     y: np.ndarray,
@@ -370,67 +534,86 @@ def _select_tau_risk_constrained(
     Pick tau to maximize coverage subject to risk<=r0 on kept set {w>=tau}.
     risk = P(y=0 | kept), coverage = kept_frac
 
+    Tie-aware: evaluates only thresholds at unique w values (group boundaries),
+    so the achieved mask {w>=tau} matches the computed (coverage, risk).
+
     Returns:
-      tau, summary dict, curve df (coverage, risk vs tau index)
+      tau, summary dict (ACHIEVED under clamped tau), curve df (coverage, risk vs threshold)
     """
-    w = np.asarray(w, dtype=np.float64)
-    y = np.asarray(y, dtype=np.int64)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.int64).reshape(-1)
     n = int(w.size)
     if n == 0 or y.size != n:
         tau = clamp(0.5, tau_min, tau_max)
         df = pd.DataFrame({"k": [], "tau": [], "coverage": [], "risk": []})
         return tau, {"coverage": float("nan"), "risk": float("nan")}, df
 
-    # sort by w descending: lowering threshold includes more samples
-    idx = np.argsort(-w)
+    w = np.clip(w, 0.0, 1.0)
+    idx = np.argsort(-w)  # descending
     ws = w[idx]
     ys = y[idx]
     bad = 1 - ys  # bad=1 when y=0
-
     cum_bad = np.cumsum(bad, dtype=np.float64)
-    ks = np.arange(1, n + 1, dtype=np.float64)
-    risk = cum_bad / ks
-    coverage = ks / float(n)
+
+    # group ends where w changes
+    change = np.where(np.diff(ws) != 0.0)[0] + 1
+    ends = np.concatenate([change, np.array([n], dtype=np.int64)], axis=0)  # 1..n
+    ks = ends.astype(np.int64)
+    bad_k = cum_bad[ks - 1]
+    risk = bad_k / ks.astype(np.float64)
+    coverage = ks.astype(np.float64) / float(n)
+    taus = ws[ks - 1]  # threshold value yielding keep all >= tau
 
     min_keep = max(1, int(math.ceil(float(min_keep_frac) * n)))
-
-    # feasible = risk<=r0 and keep>=min_keep
-    feasible = (risk <= float(r0)) & (ks >= float(min_keep))
+    feasible = (risk <= float(r0)) & (ks >= int(min_keep))
 
     if feasible.any():
-        # maximize coverage => choose largest k among feasible
-        k_star = int(np.where(feasible)[0].max()) + 1
+        i_star = int(np.where(feasible)[0].max())
     else:
-        # if nothing feasible, choose k that minimizes risk (with min_keep constraint)
-        valid = ks >= float(min_keep)
+        # among ks>=min_keep, pick minimal risk; else k=1
+        valid = ks >= int(min_keep)
         if valid.any():
-            k_star = int(np.where(valid)[0][np.argmin(risk[valid])]) + 1
+            i_star = int(np.where(valid)[0][np.argmin(risk[valid])])
         else:
-            k_star = 1
+            i_star = 0
 
-    # tau can be set to ws[k_star-1] (keep all >= tau)
-    tau = float(ws[k_star - 1])
-    tau = clamp(tau, tau_min, tau_max)
+    tau_raw = float(taus[i_star])
+    tau = float(clamp(tau_raw, tau_min, tau_max))
+
+    # achieved under clamped tau
+    kept = w >= tau
+    k_ach = int(kept.sum())
+    if k_ach <= 0:
+        cov_ach = 0.0
+        risk_ach = float("nan")
+    else:
+        cov_ach = k_ach / float(n)
+        risk_ach = float((1 - y[kept]).mean())
 
     df = pd.DataFrame(
         {
             "k": ks.astype(int),
-            "tau": ws,
-            "coverage": coverage,
-            "risk": risk,
+            "tau": taus.astype(np.float64),
+            "coverage": coverage.astype(np.float64),
+            "risk": risk.astype(np.float64),
         }
     )
 
     summary = {
-        "coverage": float(coverage[k_star - 1]),
-        "risk": float(risk[k_star - 1]),
-        "k": float(k_star),
+        "coverage": float(cov_ach),
+        "risk": float(risk_ach),
+        "k": float(k_ach),
         "n": float(n),
         "min_keep": float(min_keep),
+        "tau_raw": float(tau_raw),
+        "tau_clamped": float(tau),
     }
     return tau, summary, df
 
 
+# -----------------------------
+# Stage 3
+# -----------------------------
 def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Path, out_dir: Path) -> None:
     out_dir = safe_mkdir(out_dir)
     analysis_dir = safe_mkdir(out_dir / "_analysis")
@@ -447,9 +630,21 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     tau_min = float(s3.get("tau_min", 1e-6))
     tau_max = float(s3.get("tau_max", 0.999999))
 
-    # risk-constrained tau config (general)
-    r0 = float(s3.get("tau_risk", 0.05))  # allow 5% bad frames among trusted frames
+    # risk-constrained tau config
+    r0 = float(s3.get("tau_risk", 0.05))
     min_keep_frac = float(s3.get("tau_min_keep_frac", 0.05))
+
+    # feature scaling
+    sc_cfg = dict(em_cfg.get("scaler", {}))
+    sc_enable = bool(sc_cfg.get("enable", True))
+    sc_clip = sc_cfg.get("clip", 8.0)
+    sc_clip = None if sc_clip is None else float(sc_clip)
+
+    # w calibration
+    wcal_cfg = dict(s3.get("w_calibration", {}))
+    wcal_enable = bool(wcal_cfg.get("enable", True))
+    wcal_method = str(wcal_cfg.get("method", "isotonic")).lower()
+    wcal_bins = int(wcal_cfg.get("bins", 50))
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -471,7 +666,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         clamp_margin_px=float(aob_cfg.get("clamp_margin_px", 0.0)),
     )
 
-
     # -----------------
     # load stage2 arrays
     # -----------------
@@ -487,18 +681,40 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     print(f"[Feat] keep dims: {keep} num_keep: {int(keep.sum())}")
 
     # -----------------
+    # feature scaling (robust + clip)
+    # -----------------
+    scaler: Optional[Dict[str, Any]] = None
+    if sc_enable:
+        scaler = _fit_robust_scaler(X_tr_k, clip=sc_clip)
+        X_tr_s = _apply_robust_scaler(X_tr_k, scaler)
+        X_va_s = _apply_robust_scaler(X_va_k, scaler)
+        write_json(analysis_dir / "feature_scaler.json", {
+            "type": "robust_iqr",
+            "clip": scaler.get("clip", None),
+            "eps": scaler.get("eps", None),
+            "center": scaler["center"].tolist(),
+            "scale": scaler["scale"].tolist(),
+            "keep_mask": keep.astype(int).tolist(),
+        })
+        print(f"[Feat] robust scaling enabled (clip={sc_clip}) -> wrote scaler to _analysis/feature_scaler.json")
+    else:
+        X_tr_s, X_va_s = X_tr_k, X_va_k
+        print("[Feat] scaling disabled")
+
+    # -----------------
     # emission model
     # -----------------
     clf = fit_emission_model(
-        X_tr_k, y_tr,
+        X_tr_s,
+        y_tr,
         c=float(em_cfg.get("c", 1.0)),
-        max_iter=int(em_cfg.get("max_iter", 2000))
+        max_iter=int(em_cfg.get("max_iter", 2000)),
     )
 
-    p_tr_raw = clf.predict_proba(X_tr_k)[:, 1].astype(np.float32)
-    p_va_raw = clf.predict_proba(X_va_k)[:, 1].astype(np.float32)
+    p_tr_raw = clf.predict_proba(X_tr_s)[:, 1].astype(np.float32)
+    p_va_raw = clf.predict_proba(X_va_s)[:, 1].astype(np.float32)
 
-    # Optional temperature scaling (general, stabilizes transfer)
+    # Optional temperature scaling
     cal_cfg = dict(em_cfg.get("calibration", {}))
     cal_enable = bool(cal_cfg.get("enable", True))
     cal_eps = float(cal_cfg.get("eps", 1e-6))
@@ -513,69 +729,105 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         p_tr, p_va = p_tr_raw, p_va_raw
         print("[Calib] disabled -> using raw probabilities")
 
-    m = emission_metrics(p_va, y_va)
+    # clamp probs before any downstream metrics / HMM usage
+    p_va_c = _clip_probs(p_va, eps=cal_eps)
+    m = emission_metrics(p_va_c, y_va)
     print(f"[Emission] AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  risk@50%={m['risk@50%']:.4f}")
 
     # -----------------
-    # helper: compute w per seq
+    # helper: compute w per seq (with SAME scaler + calib)
     # -----------------
+    def _transform_X(X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        Xk = X[:, keep].astype(np.float32)
+        if scaler is not None:
+            return _apply_robust_scaler(Xk, scaler)
+        return Xk
+
     def _seq_post_w(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         arr, _ = npz_read(npz_path)
-        X = arr["X"][:, keep].astype(np.float32)
-        p_raw = clf.predict_proba(X)[:, 1].astype(np.float32)
+        Xs = _transform_X(arr["X"])
+        p_raw = clf.predict_proba(Xs)[:, 1].astype(np.float32)
         if cal_enable:
             p = apply_temperature_scaling(p_raw, T, eps=cal_eps)
         else:
             p = p_raw
+        p = _clip_probs(p, eps=cal_eps)
         w = forward_backward_binary(p, hmm)
         y = arr.get("y", np.zeros((w.shape[0],), dtype=np.uint8)).astype(np.uint8)
-        return w, p, y
+        return w.astype(np.float32), p.astype(np.float32), y
 
     # -----------------
-    # tau selection (global)
+    # (A) collect train w,y once (also reused for tau + w-calibration)
+    # -----------------
+    ws_tr, ys_tr = [], []
+    for pth in sorted(stage2_train.glob("*.npz")):
+        w_post, _p, y = _seq_post_w(pth)
+        ws_tr.append(w_post)
+        ys_tr.append(y.astype(np.uint8))
+    w_post_all = np.concatenate(ws_tr, axis=0) if ws_tr else np.zeros((0,), dtype=np.float32)
+    y_all = np.concatenate(ys_tr, axis=0) if ys_tr else np.zeros((0,), dtype=np.uint8)
+
+    # -----------------
+    # w calibration (train only) -> wtil used for gating/semantics
+    # -----------------
+    w_cal: Callable[[np.ndarray], np.ndarray]
+    if wcal_enable and w_post_all.size > 0 and y_all.size == w_post_all.size:
+        w_cal = _fit_w_calibrator(w_post_all, y_all, method=wcal_method, n_bins=wcal_bins)
+        wtil_all = w_cal(w_post_all)
+        print(f"[W-Calib] enabled method={wcal_method} bins={wcal_bins}")
+        # save a simple reliability curve (train) for debugging
+        if bool(ana_cfg.get("write_figs", True)):
+            bins = np.linspace(0.0, 1.0, 11)
+            xs, accs, cnts = [], [], []
+            for i in range(10):
+                lo, hi = bins[i], bins[i + 1]
+                msk = (wtil_all >= lo) & (wtil_all < hi) if i < 9 else (wtil_all >= lo) & (wtil_all <= hi)
+                if msk.sum() == 0:
+                    continue
+                xs.append(0.5 * (lo + hi))
+                accs.append(float(y_all[msk].mean()))
+                cnts.append(int(msk.sum()))
+            plt.figure()
+            plt.plot(xs, accs, marker="o")
+            plt.xlabel("wtil bin center (calibrated)")
+            plt.ylabel("empirical P(y=1)")
+            plt.title("Reliability curve on train (after w calibration)")
+            plt.tight_layout()
+            plt.savefig(analysis_dir / "fig_wcal_reliability_train.png", dpi=160)
+            plt.close()
+    else:
+        w_cal = lambda w: np.clip(np.asarray(w, dtype=np.float32), 0.0, 1.0)
+        wtil_all = w_post_all.astype(np.float32)
+        print("[W-Calib] disabled/insufficient data -> using raw HMM posterior")
+
+    # -----------------
+    # tau selection (global / risk)
     # -----------------
     tau_global: float = 0.5
 
     if tau_mode == "global":
-        # old: quantile on train w
-        ws = []
-        for pth in sorted(stage2_train.glob("*.npz")):
-            w, _, _ = _seq_post_w(pth)
-            ws.append(w)
-        w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
-        if w_all.size == 0:
+        if wtil_all.size == 0:
             tau_global = 0.5
         else:
-            tau_global = float(np.quantile(w_all, target_frac))
+            tau_global = float(np.quantile(wtil_all.astype(np.float64), target_frac))
             tau_global = clamp(tau_global, tau_min, tau_max)
         print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
 
     elif tau_mode == "risk":
-        # new: risk-constrained tau on train (general)
-        ws, ys = [], []
-        for pth in sorted(stage2_train.glob("*.npz")):
-            w, _, y = _seq_post_w(pth)
-            ws.append(w.astype(np.float32))
-            ys.append(y.astype(np.uint8))
-        w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
-        y_all = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
-
         tau_global, summ, curve = _select_tau_risk_constrained(
-            w_all, y_all, r0=r0, min_keep_frac=min_keep_frac, tau_min=tau_min, tau_max=tau_max
+            wtil_all, y_all, r0=r0, min_keep_frac=min_keep_frac, tau_min=tau_min, tau_max=tau_max
         )
 
         print(
             f"[Tau] risk-constrained: tau_global={tau_global:.6f}  "
-            f"coverage={summ['coverage']:.3f}  risk={summ['risk']:.3f}  r0={r0}"
+            f"coverage={summ['coverage']:.3f}  risk={summ['risk']:.3f}  r0={r0} "
+            f"(tau_raw={summ['tau_raw']:.6f} -> tau_clamped={summ['tau_clamped']:.6f})"
         )
 
-        # save curve
         curve_path = analysis_dir / "tau_risk_curve_train.csv"
         curve.to_csv(curve_path, index=False)
-        (analysis_dir / "tau_risk_summary_train.json").write_text(
-            pd.Series({**summ, "tau": tau_global, "r0": r0, "min_keep_frac": min_keep_frac}).to_json(),
-            encoding="utf-8",
-        )
+        write_json(analysis_dir / "tau_risk_summary_train.json", {**summ, "r0": r0, "min_keep_frac": min_keep_frac})
 
         if bool(ana_cfg.get("write_figs", True)) and len(curve) > 0:
             plt.figure()
@@ -583,7 +835,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             plt.axhline(r0, linestyle="--")
             plt.xlabel("coverage (kept fraction)")
             plt.ylabel("risk (P(y=0 | kept))")
-            plt.title("Coverage–Risk curve (train)")
+            plt.title("Coverage–Risk curve (train, tie-aware)")
             plt.tight_layout()
             plt.savefig(analysis_dir / "fig_coverage_risk_train.png", dpi=160)
             plt.close()
@@ -597,34 +849,38 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     rows = []
     all_w_val = []
     all_err_obs_val = []
+    all_y_val = []
 
     pbar = tqdm(sorted(stage2_val.glob("*.npz")), desc="Stage3(val)")
     for npz_path in pbar:
         arr, meta = npz_read(npz_path)
         seq = meta.get("seq", npz_path.stem)
 
-        X = arr["X"][:, keep].astype(np.float32)
+        Xs = _transform_X(arr["X"])
         z_gt = arr["z_gt"].astype(np.float32)
         z_obs = arr["z_obs"].astype(np.float32)
 
-        p_raw = clf.predict_proba(X)[:, 1].astype(np.float32)
+        p_raw = clf.predict_proba(Xs)[:, 1].astype(np.float32)
         p = apply_temperature_scaling(p_raw, T, eps=cal_eps) if cal_enable else p_raw
-        w = forward_backward_binary(p, hmm)
+        p = _clip_probs(p, eps=cal_eps)
 
-        if tau_mode == "global":
-            tau = float(tau_global)
-        elif tau_mode == "risk":
+        w_post = forward_backward_binary(p, hmm).astype(np.float32)
+        y = arr.get("y", np.zeros((w_post.shape[0],), dtype=np.uint8)).astype(np.uint8)
+
+        # calibrated wtil for gating/semantics
+        w = w_cal(w_post)
+
+        if tau_mode in ("global", "risk"):
             tau = float(tau_global)
         elif tau_mode == "per_video":
-            # keep legacy option (not recommended for transfer)
-            tau = float(np.quantile(w, target_frac)) if w.size else 0.5
+            tau = float(np.quantile(w.astype(np.float64), target_frac)) if w.size else 0.5
             tau = clamp(tau, tau_min, tau_max)
         else:
             raise ValueError(f"Unknown tau_mode={tau_mode}")
 
         seg_debug = [] if (debug_aob and seq in debug_seqs) else None
         z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=w, tau=tau, params=aobp, debug=seg_debug)
-        
+
         if debug_aob and seq in debug_seqs:
             Tseq = int(len(w))
             q = np.quantile(w.astype(np.float64), [0.0, 0.01, 0.05, 0.5, 0.95, 0.99, 1.0]).tolist()
@@ -634,12 +890,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             err_obs = np.linalg.norm((z_obs - z_gt).astype(np.float64), axis=1)
             err_fin = np.linalg.norm((z_fin - z_gt).astype(np.float64), axis=1)
 
-            def _q95(x): 
+            def _q95(x):
                 return float(np.quantile(x, 0.95)) if x.size else float("nan")
 
             pbar.write(
                 f"[AoB-Debug] seq={seq} tau={tau:.6f} "
-                f"w[q0,q1,q5,q50,q95,q99,q100]={['%.4f'%v for v in q]} "
+                f"wtil[q0,q1,q5,q50,q95,q99,q100]={['%.4f'%v for v in q]} "
                 f"low_frac={low_n/max(Tseq,1):.4f} low_n={low_n} segs={0 if seg_debug is None else len(seg_debug)}"
             )
             if low_n > 0:
@@ -648,27 +904,29 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     f"err_obs_p95_low={_q95(err_obs[low_mask]):.3f} err_fin_p95_low={_q95(err_fin[low_mask]):.3f}"
                 )
 
-            # 写 JSON，方便你之后离线看每段决策
-            write_json(analysis_dir / f"debug_aob_{seq}.json", {
-                "seq": seq,
-                "tau": float(tau),
-                "aobp": {
-                    "eps_gate": aobp.eps_gate,
-                    "abstain_mode": aobp.abstain_mode,
-                    "eta_L": aobp.eta_L,
-                    "eta_u": aobp.eta_u,
-                    "max_bridge_len": aobp.max_bridge_len,
+            write_json(
+                analysis_dir / f"debug_aob_{seq}.json",
+                {
+                    "seq": seq,
+                    "tau": float(tau),
+                    "aobp": {
+                        "eps_gate": aobp.eps_gate,
+                        "abstain_mode": aobp.abstain_mode,
+                        "eta_L": aobp.eta_L,
+                        "eta_u": aobp.eta_u,
+                        "max_bridge_len": aobp.max_bridge_len,
+                    },
+                    "w_quantiles": q,
+                    "segments": seg_debug if seg_debug is not None else [],
                 },
-                "w_quantiles": q,
-                "segments": seg_debug if seg_debug is not None else [],
-            })
-            
+            )
+
         sm = compute_seq_metrics(
             seq=seq,
             z_gt=z_gt,
             z_obs=z_obs,
             z_fin=z_fin,
-            w=w,
+            w=w,  # NOTE: using calibrated wtil
             tau=tau,
             is_bridge=is_bridge,
             is_abst=is_abst,
@@ -676,8 +934,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         )
         rows.append(metrics_to_row(sm))
 
-        all_w_val.append(w)
+        all_w_val.append(w.astype(np.float32))
         all_err_obs_val.append(arr["err_obs"].astype(np.float32))
+        all_y_val.append(y.astype(np.float32))
 
     df = pd.DataFrame(rows)
     if len(df) > 0:
@@ -711,29 +970,25 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
     # figs
     if bool(ana_cfg.get("write_figs", True)) and len(df) > 0:
-        # gate bins: reliability vs empirical accuracy
+        # gate bins: reliability vs empirical accuracy (VAL, calibrated)
         wcat = np.concatenate(all_w_val, axis=0) if all_w_val else np.zeros((0,), dtype=np.float32)
-        ys = []
-        for pth in sorted(stage2_val.glob("*.npz")):
-            arr2, _ = npz_read(pth)
-            ys.append(arr2["y"].astype(np.float32))
-        ycat = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.float32)
+        ycat = np.concatenate(all_y_val, axis=0) if all_y_val else np.zeros((0,), dtype=np.float32)
 
         if wcat.size == ycat.size and wcat.size > 0:
             bins = np.linspace(0.0, 1.0, 11)
             xs, accs = [], []
             for i in range(10):
                 lo, hi = bins[i], bins[i + 1]
-                m = (wcat >= lo) & (wcat < hi) if i < 9 else (wcat >= lo) & (wcat <= hi)
-                if m.sum() == 0:
+                msk = (wcat >= lo) & (wcat < hi) if i < 9 else (wcat >= lo) & (wcat <= hi)
+                if msk.sum() == 0:
                     continue
                 xs.append(0.5 * (lo + hi))
-                accs.append(float(ycat[m].mean()))
+                accs.append(float(ycat[msk].mean()))
             plt.figure()
             plt.plot(xs, accs, marker="o")
             plt.xlabel("wtil bin center")
             plt.ylabel("empirical P(y=1)")
-            plt.title("Gate bins (reliability semantics)")
+            plt.title("Gate bins (reliability semantics, val)")
             plt.tight_layout()
             plt.savefig(analysis_dir / "fig_gate_bins.png", dpi=160)
             plt.close()
@@ -756,11 +1011,20 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         plt.savefig(analysis_dir / "fig_lowfrac_hist.png", dpi=160)
         plt.close()
 
+        # feature hist: plot clipped ranges to avoid one dim dominating x-axis
         plt.figure()
         for j in range(X_tr.shape[1]):
-            plt.hist(X_tr[:, j], bins=30, alpha=0.5, label=f"dim{j}")
+            v = X_tr[:, j].astype(np.float64)
+            if v.size == 0:
+                continue
+            lo = float(np.quantile(v, 0.01))
+            hi = float(np.quantile(v, 0.99))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(v.min()), float(v.max())
+            vv = np.clip(v, lo, hi)
+            plt.hist(vv, bins=30, alpha=0.5, label=f"dim{j}")
         plt.legend()
-        plt.title("Feature hist (train)")
+        plt.title("Feature hist (train, per-dim clipped 1%-99%)")
         plt.tight_layout()
         plt.savefig(analysis_dir / "fig_feat_hist.png", dpi=160)
         plt.close()
@@ -781,12 +1045,17 @@ def run_all(cfg: Dict[str, Any]) -> None:
 
     out_dir_s3 = base_out / cfg.get("stage3", {}).get("out_dir", "davis2016_stage3_fixed")
 
-    print(pretty_header("PR2-Drag Lite", {
-        "cmd": "run_all",
-        "davis_root": str(davis_root),
-        "res": res,
-        "base_out": str(base_out),
-    }))
+    print(
+        pretty_header(
+            "PR2-Drag Lite",
+            {
+                "cmd": "run_all",
+                "davis_root": str(davis_root),
+                "res": res,
+                "base_out": str(base_out),
+            },
+        )
+    )
 
     meta_tr = stage1_precompute_split(cfg, split="train", out_dir=out_train_s1)
     print(f"[OK] Stage1(train) meta: {out_train_s1/'meta.json'}")
@@ -798,6 +1067,8 @@ def run_all(cfg: Dict[str, Any]) -> None:
 
     stage2_compute_split(cfg, split="train", stage1_dir=out_train_s1, out_dir=out_train_s2)
     stage2_compute_split(cfg, split="val", stage1_dir=out_val_s1, out_dir=out_val_s2)
-    print(f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} val_npz= {len(list(out_val_s2.glob('*.npz')))}")
+    print(
+        f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} val_npz= {len(list(out_val_s2.glob('*.npz')))}"
+    )
 
     stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)
