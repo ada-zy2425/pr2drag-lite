@@ -1300,7 +1300,98 @@ def _apply_safe_bridge(*, mode: str, z_obs: np.ndarray, z_fin: np.ndarray, t0: i
     warnings.warn(f"[SegRouting] unknown bridge_mode_relaxed='{mode}', fallback to linear_safe")
     _safe_bridge_linear(z_obs=z_obs, z_fin=z_fin, t0=t0, t1=t1, left=left, right=right)
     return "linear_safe"
-# ============================================================
+
+def _dump_stage3_seq_npz(
+    out_npz: Path,
+    *,
+    seq: str,
+    z_gt: np.ndarray,
+    z_obs: np.ndarray,
+    z_fin: np.ndarray,
+    p: np.ndarray,
+    w_raw: np.ndarray,
+    wtil: np.ndarray,
+    tau: float,
+    is_bridge: np.ndarray,
+    is_abst: np.ndarray,
+    img_hw: Optional[np.ndarray] = None,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Dump per-sequence artifacts for video rendering / debugging.
+    Strictly numeric arrays only (no object dtype) to keep npz stable & small.
+    """
+    out_npz = Path(out_npz)
+    safe_mkdir(out_npz.parent)
+
+    # ---- shape & dtype normalization (defensive)
+    z_gt = np.asarray(z_gt, dtype=np.float32)
+    z_obs = np.asarray(z_obs, dtype=np.float32)
+    z_fin = np.asarray(z_fin, dtype=np.float32)
+
+    if z_gt.ndim != 2 or z_gt.shape[1] != 2:
+        raise ValueError(f"[DumpNPZ] z_gt shape must be (T,2), got {z_gt.shape} (seq={seq})")
+    if z_obs.shape != z_gt.shape or z_fin.shape != z_gt.shape:
+        raise ValueError(
+            f"[DumpNPZ] z shape mismatch (seq={seq}): "
+            f"z_gt={z_gt.shape} z_obs={z_obs.shape} z_fin={z_fin.shape}"
+        )
+
+    T = int(z_gt.shape[0])
+
+    p = np.asarray(p, dtype=np.float32).reshape(-1)
+    w_raw = np.asarray(w_raw, dtype=np.float32).reshape(-1)
+    wtil = np.asarray(wtil, dtype=np.float32).reshape(-1)
+    is_bridge = np.asarray(is_bridge, dtype=bool).reshape(-1)
+    is_abst = np.asarray(is_abst, dtype=bool).reshape(-1)
+
+    for name, arr in [("p", p), ("w_raw", w_raw), ("w", wtil), ("is_bridge", is_bridge), ("is_abst", is_abst)]:
+        if arr.size != T:
+            raise ValueError(f"[DumpNPZ] {name} size mismatch: {arr.size} vs T={T} (seq={seq})")
+
+    if img_hw is None:
+        img_hw = np.array([0, 0], dtype=np.int32)
+    else:
+        img_hw = np.asarray(img_hw, dtype=np.int32).reshape(-1)
+        if img_hw.size < 2:
+            img_hw = np.array([0, 0], dtype=np.int32)
+        else:
+            img_hw = img_hw[:2].astype(np.int32, copy=False)
+
+    tau_f = float(tau)
+    tau_f = float(np.clip(tau_f, 0.0, 1.0))
+
+    arrays = {
+        "z_gt": z_gt,
+        "z_obs": z_obs,
+        "z_fin": z_fin,
+        "p": p,
+        "w_raw": w_raw,
+        "w": wtil,  # calibrated/overridden reliability used by AoB
+        "tau": np.array([tau_f], dtype=np.float32),
+        "is_bridge": is_bridge.astype(np.uint8),
+        "is_abstain": is_abst.astype(np.uint8),
+        "low_mask": (wtil < tau_f).astype(np.uint8),
+        "img_hw": img_hw.astype(np.int32),
+    }
+
+    meta: Dict[str, Any] = {
+        "seq": str(seq),
+        "T": int(T),
+        "tau": float(tau_f),
+        "version": "stage3_dump_v1",
+    }
+    if extra_meta:
+        # make sure meta stays json-serializable
+        for k, v in extra_meta.items():
+            try:
+                json.dumps(v)
+                meta[str(k)] = v
+            except Exception:
+                meta[str(k)] = str(v)
+
+    npz_write(out_npz, arrays=arrays, meta=meta)
+
 def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Path, out_dir: Path) -> None:
     out_dir = safe_mkdir(out_dir)
     analysis_dir = safe_mkdir(out_dir / "_analysis")
@@ -1328,6 +1419,17 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     aob_cfg = s3.get("aob", {})
     met_cfg = s3.get("metrics", {})
     ana_cfg = s3.get("analysis", {})
+
+    # --- NEW: dump per-seq npz for rendering
+    dump_npz = bool(ana_cfg.get("dump_npz", False))
+    dump_npz_dir = str(ana_cfg.get("dump_npz_dir", "_analysis/npz")).strip() or "_analysis/npz"
+    # relative path -> under out_dir
+    dump_root = Path(dump_npz_dir)
+    if not dump_root.is_absolute():
+        dump_root = out_dir / dump_root
+    if dump_npz:
+        safe_mkdir(dump_root)
+        print(f"[DumpNPZ] enabled -> {dump_root}")
 
     # --- Segment routing config (safety filter)
     sr_raw = dict(s3.get("segment_routing", {}))
@@ -1672,7 +1774,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 wtil = (err_obs_1d < float(oracle_err_px)).astype(np.float32)
             else:
                 raise ValueError(f"[Oracle] unknown source={oracle_source}, expected y|err")
-            tau = float(oracle_tau)
+            tau = clamp(float(oracle_tau), tau_min, tau_max)
 
         seg_debug = [] if (debug_aob and seq in debug_seqs) else None
 
@@ -1888,6 +1990,35 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 "wtil_quantiles": q,
                 "segments": seg_debug if seg_debug is not None else [],
             })
+
+        # --- NEW: dump per-seq artifact for rendering/debug
+        if dump_npz:
+            try:
+                out_npz = dump_root / f"{seq}.npz"
+                _dump_stage3_seq_npz(
+                    out_npz,
+                    seq=str(seq),
+                    z_gt=z_gt,
+                    z_obs=z_obs,
+                    z_fin=z_fin,
+                    p=p,
+                    w_raw=w_raw,
+                    wtil=wtil,
+                    tau=float(tau),
+                    is_bridge=is_bridge,
+                    is_abst=is_abst,
+                    img_hw=arr.get("img_hw", np.array([0, 0], dtype=np.int32)),
+                    extra_meta={
+                        "tau_mode": str(tau_mode),
+                        "oracle_enable": bool(oracle_enable),
+                        "oracle_source": str(oracle_source),
+                        "w_override": str(w_override),
+                        "hmm_enable": bool(hmm_enable),
+                        "w_calibration_enable": bool(wc_enable),
+                    },
+                )
+            except Exception as e:
+                print(f"[DumpNPZ][Warn] failed seq={seq}: {type(e).__name__}: {e}")
 
         sm = compute_seq_metrics(
             seq=seq,

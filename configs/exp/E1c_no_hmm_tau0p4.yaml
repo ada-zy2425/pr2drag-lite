@@ -23,19 +23,12 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_E0b4_safe_bridge_speed"
-
-  tau_mode: "risk"
-  tau_risk: 0.005
-  tau_target_frac: 0.10
-  tau_min_keep_frac: 0.05
-  tau_min: 1e-6
-  tau_max: 0.999999
+  out_dir: "davis2016_E1c_no_hmm_tau0p4"
+  oracle_enable: true
+  oracle_tau: 0.4
 
   w_calibration:
-    enable: true
-    method: "isotonic"
-    bins: 50
+    enable: false
 
   feature_scaler:
     enable: true
@@ -44,18 +37,14 @@ stage3:
     eps: 1e-6
 
   hmm:
+    enable: false
     prior_good: 0.85
-    p_stay_good: 0.92
-    p_stay_bad: 0.92
-    eps: 1e-3
 
   emission:
     calibration:
       enable: true
       eps: 1e-6
 
-  oracle:
-    enable: false
 
   aob:
     abstain_mode: "linear"
@@ -75,14 +64,11 @@ stage3:
     write_csv: true
     write_figs: true
     log_to_file: true
-    dump_npz: true
-    dump_npz_dir: "_analysis/npz"
     archive:
       enable: true
       pack_root: "_paperpack"
       zip: true
       copy_out_dir: false
-
 
   segment_routing:
     enable: true
