@@ -24,19 +24,23 @@ stage2:
 
 stage3:
   out_dir: "davis2016_E7_w_ones"
-  w_override: "ones"   
 
-  tau_mode: "risk"
-  tau_risk: 0.005
-  tau_target_frac: 0.10
-  tau_min_keep_frac: 0.05
-  tau_min: 1e-6
-  tau_max: 0.999999
+  # --- 纯 baseline ---
+  w_override: "ones"     #
+  tau_mode: "global"  
+  tau_global: 0.0    
 
+  
   w_calibration:
-    enable: true
-    method: "isotonic"
-    bins: 50
+    enable: false
+
+  hmm:
+    enable: false
+
+  emission:
+    calibration:
+      enable: false
+      eps: 1e-6
 
   feature_scaler:
     enable: true
@@ -44,30 +48,16 @@ stage3:
     clip: 8.0
     eps: 1e-6
 
-  hmm:
-    prior_good: 0.85
-    p_stay_good: 0.92
-    p_stay_bad: 0.92
-    eps: 1e-3
-
-  emission:
-    calibration:
-      enable: true
-      eps: 1e-6
-
   oracle:
     enable: false
 
+  # AoB / segment routing 在 low_frac=0 时不会触发；保留无害，但也可以关掉更干净
   aob:
-    abstain_mode: "linear"
-    max_bridge_len: 999
+    abstain_mode: "hold"    
     eps_gate: 0.0
-    eta_L: 0.0
-    eta_u: 0.0
-    bridge_mode: "hermite"
-    hermite_scan: 6
-    clamp_hermite: true
-    clamp_margin_px: 0.0
+
+  segment_routing:
+    enable: false
 
   metrics:
     fail_px: 50.0
@@ -83,20 +73,3 @@ stage3:
       pack_root: "_paperpack"
       zip: true
       copy_out_dir: false
-
-
-  segment_routing:
-    enable: true
-    mode: "train_quantile"
-    disp_norm_q: 0.95
-    Lmax: 10
-    require_both_sides: true
-    use_speed: true
-    speed_norm_q: 0.97
-    L_short: 2
-    bridge_mode_relaxed: "hermite_safe"
-
-
-
-
-
