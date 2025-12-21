@@ -25,7 +25,7 @@ stage2:
 stage3:
   out_dir: "davis2016_exp4_abstain_only"
 
-  tau_mode: risk
+  tau_mode: "risk"
   tau_risk: 0.02
   tau_target_frac: 0.10
   tau_min_keep_frac: 0.05
@@ -34,12 +34,12 @@ stage3:
 
   w_calibration:
     enable: true
-    method: isotonic
+    method: "isotonic"
     bins: 50
 
   feature_scaler:
     enable: true
-    type: robust_iqr
+    type: "robust_iqr"
     clip: 8.0
     eps: 1e-6
 
@@ -59,16 +59,17 @@ stage3:
 
   oracle:
     enable: false
-    source: y
+    source: "y"
     tau: 0.5
 
+  # hard-disable bridging
   aob:
-    abstain_mode: linear
-    eps_gate: 0.0
+    abstain_mode: "linear"
+    max_bridge_len: 0          # core switch: no segment can be bridged
+    eps_gate: 1.0              # extra保险：即便代码走 gate，也会被拒绝
     eta_L: 0.0
     eta_u: 0.0
-    max_bridge_len: 0
-    bridge_mode: hermite
+    bridge_mode: "hermite"
     hermite_scan: 6
     clamp_hermite: true
     clamp_margin_px: 0.0
@@ -88,10 +89,10 @@ stage3:
 
   segment_routing:
     enable: true
-    mode: train_quantile
+    mode: "train_quantile"
     disp_norm_q: 0.95
     disp_norm: null
-    Lmax: 10
+    Lmax: 0                  # extra保险：router 也不允许 bridge
     require_both_sides: true
     use_speed: false
     speed_norm_q: 0.97

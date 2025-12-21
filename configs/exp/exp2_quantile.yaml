@@ -23,23 +23,22 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_exp2_quantile"
+  out_dir: "davis2016_exp2_globalq_p45 "
 
-  tau_mode: quantile
-  tau_target_frac: 0.10
-  tau_risk: 0.02
+  tau_mode: "global"
+  tau_target_frac: 0.45
   tau_min_keep_frac: 0.05
   tau_min: 1e-6
   tau_max: 0.999999
 
   w_calibration:
     enable: true
-    method: isotonic
+    method: "isotonic"
     bins: 50
 
   feature_scaler:
     enable: true
-    type: robust_iqr
+    type: "robust_iqr"
     clip: 8.0
     eps: 1e-6
 
@@ -59,16 +58,16 @@ stage3:
 
   oracle:
     enable: false
-    source: y
+    source: "y"
     tau: 0.5
 
   aob:
-    abstain_mode: linear
+    abstain_mode: "linear"
+    max_bridge_len: 999
     eps_gate: 0.0
     eta_L: 0.0
     eta_u: 0.0
-    max_bridge_len: 999
-    bridge_mode: hermite
+    bridge_mode: "hermite"
     hermite_scan: 6
     clamp_hermite: true
     clamp_margin_px: 0.0
@@ -88,7 +87,7 @@ stage3:
 
   segment_routing:
     enable: true
-    mode: train_quantile
+    mode: "train_quantile"
     disp_norm_q: 0.95
     disp_norm: null
     Lmax: 10

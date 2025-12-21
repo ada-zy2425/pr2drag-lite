@@ -23,18 +23,16 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_exp3_no_wcalib"
+  out_dir: "davis2016_exp2_quantile"
 
-  tau_mode: "risk"
-  tau_risk: 0.02
-  tau_target_frac: 0.10
+  tau_mode: "global"
+  tau_target_frac: 0.45
   tau_min_keep_frac: 0.05
   tau_min: 1e-6
   tau_max: 0.999999
 
-  # disable w calibration
   w_calibration:
-    enable: false
+    enable: true
     method: "isotonic"
     bins: 50
 

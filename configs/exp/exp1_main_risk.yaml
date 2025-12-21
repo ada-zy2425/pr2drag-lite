@@ -25,30 +25,35 @@ stage2:
 stage3:
   out_dir: "davis2016_exp1_main_risk"
 
-  tau_mode: risk
+  # --- tau selection ---
+  tau_mode: "risk"
   tau_risk: 0.02
   tau_target_frac: 0.10
   tau_min_keep_frac: 0.05
   tau_min: 1e-6
   tau_max: 0.999999
 
+  # --- posterior calibration (wtil) ---
   w_calibration:
     enable: true
-    method: isotonic
+    method: "isotonic"
     bins: 50
 
+  # --- feature scaling ---
   feature_scaler:
     enable: true
-    type: robust_iqr
+    type: "robust_iqr"
     clip: 8.0
     eps: 1e-6
 
+  # --- HMM prior ---
   hmm:
     prior_good: 0.85
     p_stay_good: 0.92
     p_stay_bad: 0.92
     eps: 1e-3
 
+  # --- emission head ---
   emission:
     scaler:
       enable: true
@@ -57,25 +62,35 @@ stage3:
       enable: true
       eps: 1e-6
 
+  # --- oracle (must be off for mainline) ---
   oracle:
     enable: false
-    source: y
+    source: "y"
     tau: 0.5
 
+  # --- AoB policy ---
   aob:
-    abstain_mode: linear
+    abstain_mode: "linear"
+
+    # allow bridging
+    max_bridge_len: 999
+
+    # gating (kept neutral here; routing decides)
     eps_gate: 0.0
     eta_L: 0.0
     eta_u: 0.0
-    max_bridge_len: 999
-    bridge_mode: hermite
+
+    # current bridge implementation
+    bridge_mode: "hermite"
     hermite_scan: 6
     clamp_hermite: true
     clamp_margin_px: 0.0
 
+  # --- failure metric ---
   metrics:
     fail_px: 50.0
 
+  # --- analysis artifacts ---
   analysis:
     write_csv: true
     write_figs: true
@@ -86,9 +101,10 @@ stage3:
       zip: true
       copy_out_dir: false
 
+  # --- segment routing ---
   segment_routing:
     enable: true
-    mode: train_quantile
+    mode: "train_quantile"   # fixed | train_quantile
     disp_norm_q: 0.95
     disp_norm: null
     Lmax: 10
