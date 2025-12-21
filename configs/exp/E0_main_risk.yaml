@@ -24,11 +24,11 @@ stage2:
 
 
 stage3:
-  out_dir: "davis2016_E0_main_risk"
+  out_dir: "davis2016_E0a_risk001"
 
   # --- tau selection ---
   tau_mode: "risk"
-  tau_risk: 0.02
+  tau_risk: 0.01
   tau_target_frac: 0.10
   tau_min_keep_frac: 0.05
   tau_min: 1e-6
