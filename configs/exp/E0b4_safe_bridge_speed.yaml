@@ -89,5 +89,5 @@ stage3:
     require_both_sides: false
     use_speed: true
     speed_norm_q: 0.97
-    L_short: 2   # L<=2 => force_safe_bridge(linear)
-
+    L_short: 2
+    bridge_mode_relaxed: "hermite_safe"
