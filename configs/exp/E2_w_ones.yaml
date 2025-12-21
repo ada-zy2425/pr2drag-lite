@@ -23,7 +23,7 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_E0b4_safe_bridge_speed"
+  out_dir: "davis2016_E2_w_ones"
 
   tau_mode: "risk"
   tau_risk: 0.005
