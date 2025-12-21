@@ -313,6 +313,7 @@ class _SegRoutingCfg:
     safe_bridge_max_len: int = 8          # L <= this => eligible for safe-bridge
     disp_relax_max: Optional[float] = 0.40  # if not None, require dnorm <= this for safe-bridge
     bridge_mode_relaxed: str = "linear_safe"  # currently only linear_safe implemented
+    L_short: int = 2   # <=2 的低段默认走 safe-bridge(linear)
 
 @dataclass
 class _SegRoutingFit:
@@ -446,6 +447,10 @@ def _fit_segment_routing_thresholds_train(
             "speed_norm_thr": None if fit.speed_norm_thr is None else float(fit.speed_norm_thr),
             "n_segments_total": int(fit.n_segments),
             "n_valid_boundary": int(fit.n_valid_boundary),
+            "safe_bridge_max_len": int(getattr(cfg, "safe_bridge_max_len", 8)),
+            "disp_relax_max": None if getattr(cfg, "disp_relax_max", None) is None else float(getattr(cfg, "disp_relax_max")),
+            "bridge_mode_relaxed": str(getattr(cfg, "bridge_mode_relaxed", "linear_safe")).lower(),
+            "L_short": int(getattr(cfg, "L_short", 0)),
         })
     except Exception as e:
         print(f"[Warn] failed to write segment_routing_fit_v1.json: {e}")
@@ -470,23 +475,11 @@ def _segment_routing_decide_masks(
     cfg: _SegRoutingCfg,
     fit: _SegRoutingFit,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[int, Dict[str, Any]]]:
-    """
-    Decide per-low-segment action:
-      - force_abst_mask: frames to override with safe-hold abstain
-      - force_safe_bridge_mask: frames to override with linear_safe bridge
-    Returns:
-      (force_abst_mask, force_safe_bridge_mask, seg_decisions)
-    seg_decisions[seg_id] includes:
-      decision: auto | force_abstain | force_safe_bridge
-      reason:   missing_boundary | too_long | disp_too_large | speed_too_large | disp_relaxed | bad_diag | ...
-      boundary_disp_norm, speed_norm, has_left, has_right, L
-    """
     low = np.asarray(low_by_tau, dtype=bool).reshape(-1)
     T = int(low.size)
 
     force_abst = np.zeros((T,), dtype=bool)
-    force_safe_bridge = np.zeros((T,), dtype=bool)
-
+    force_safe = np.zeros((T,), dtype=bool)
     segs = _segments_from_mask(low)
 
     z_obs = np.asarray(z_obs, dtype=np.float32)
@@ -494,33 +487,41 @@ def _segment_routing_decide_masks(
 
     decisions: Dict[int, Dict[str, Any]] = {}
 
+    # thresholds (may be None)
+    disp_thr = None if fit.disp_norm_thr is None else float(fit.disp_norm_thr)
+    speed_thr = None if fit.speed_norm_thr is None else float(fit.speed_norm_thr)
+
+    safe_L = int(getattr(cfg, "safe_bridge_max_len", 8))
+    L_short = int(getattr(cfg, "L_short", 0))
+    disp_relax_max = getattr(cfg, "disp_relax_max", None)
+    disp_relax_max = None if disp_relax_max is None else float(disp_relax_max)
+    mode_relaxed = str(getattr(cfg, "bridge_mode_relaxed", "linear_safe")).lower()
+    SUPPORTED_SAFE = {"linear_safe", "hermite_safe"}
+    if mode_relaxed not in SUPPORTED_SAFE:
+        mode_relaxed = "linear_safe"
     if not np.isfinite(diag) or diag <= 0:
+        # no geometry => do nothing (auto), but still record
         for seg_id, (t0, t1) in enumerate(segs):
             decisions[int(seg_id)] = {
                 "decision": "auto",
                 "reason": "bad_diag",
                 "boundary_disp_norm": float("nan"),
                 "speed_norm": float("nan"),
-                "has_left": int(0),
-                "has_right": int(0),
+                "has_left": 0,
+                "has_right": 0,
                 "L": int(t1 - t0 + 1),
             }
-        return force_abst, force_safe_bridge, decisions
-
-    disp_thr = None if fit.disp_norm_thr is None else float(fit.disp_norm_thr)
-    speed_thr = None if fit.speed_norm_thr is None else float(fit.speed_norm_thr)
-    safe_L = int(getattr(cfg, "safe_bridge_max_len", 8))
-    disp_relax_max = getattr(cfg, "disp_relax_max", None)
-    disp_relax_max = None if disp_relax_max is None else float(disp_relax_max)
+        return force_abst, force_safe, decisions
 
     for seg_id, (t0, t1) in enumerate(segs):
         L = int(t1 - t0 + 1)
         left = t0 - 1
         right = t1 + 1
+
         has_left = (left >= 0) and (not bool(low[left]))
         has_right = (right < T) and (not bool(low[right]))
 
-        # compute boundary disp if possible
+        # compute boundary stats if possible
         dnorm = float("nan")
         vnorm = float("nan")
         if has_left and has_right:
@@ -528,15 +529,12 @@ def _segment_routing_decide_masks(
             dnorm = float(dpx / diag)
             vnorm = float(dnorm / max(L, 1))
 
-        reasons: List[str] = []
-
-        # (A) missing boundary (if required) -> abstain
+        # ---- Priority 1: missing boundary (if required) -> abstain
         if cfg.require_both_sides and not (has_left and has_right):
-            reasons.append("missing_boundary")
             force_abst[t0:t1 + 1] = True
             decisions[int(seg_id)] = {
                 "decision": "force_abstain",
-                "reason": ",".join(reasons),
+                "reason": "missing_boundary",
                 "boundary_disp_norm": dnorm,
                 "speed_norm": vnorm,
                 "has_left": int(has_left),
@@ -545,72 +543,119 @@ def _segment_routing_decide_masks(
             }
             continue
 
-        # (B) too long -> abstain
+        # ---- Priority 2: too long -> abstain
         if L > int(cfg.Lmax):
-            reasons.append("too_long")
-
-        # (C) speed gate -> abstain
-        if cfg.use_speed and speed_thr is not None and np.isfinite(vnorm):
-            if float(vnorm) > float(speed_thr):
-                reasons.append("speed_too_large")
-
-        # (D) disp gate -> either safe-bridge (if eligible) OR abstain
-        disp_bad = False
-        if disp_thr is not None and np.isfinite(dnorm):
-            if float(dnorm) > float(disp_thr):
-                disp_bad = True
-
-        if disp_bad:
-            # eligible for safe-bridge iff: has both boundaries, short segment, and optional relax cap
-            eligible = bool(has_left and has_right and (L <= safe_L))
-            if eligible and (disp_relax_max is not None) and np.isfinite(dnorm):
-                eligible = eligible and (float(dnorm) <= float(disp_relax_max))
-
-            if eligible and str(getattr(cfg, "bridge_mode_relaxed", "linear_safe")).lower() == "linear_safe":
-                # choose safe-bridge instead of abstain
-                force_safe_bridge[t0:t1 + 1] = True
-                decisions[int(seg_id)] = {
-                    "decision": "force_safe_bridge",
-                    "reason": "disp_relaxed",
-                    "boundary_disp_norm": dnorm,
-                    "speed_norm": vnorm,
-                    "has_left": int(has_left),
-                    "has_right": int(has_right),
-                    "L": int(L),
-                }
-                continue
-            else:
-                reasons.append("disp_too_large")
-
-        # If any hard reason exists -> abstain
-        if len(reasons) > 0:
             force_abst[t0:t1 + 1] = True
             decisions[int(seg_id)] = {
                 "decision": "force_abstain",
-                "reason": ",".join(reasons),
+                "reason": "too_long",
                 "boundary_disp_norm": dnorm,
                 "speed_norm": vnorm,
                 "has_left": int(has_left),
                 "has_right": int(has_right),
                 "L": int(L),
             }
-        else:
+            continue
+
+        # ---- Priority 3: very short segment -> safe-bridge (only if we have both boundaries)
+        if (L_short > 0) and (L <= L_short) and (has_left and has_right):
+            force_safe[t0:t1 + 1] = True
             decisions[int(seg_id)] = {
-                "decision": "auto",
-                "reason": "",
+                "decision": "force_safe_bridge",
+                "reason": "short_seg",
                 "boundary_disp_norm": dnorm,
                 "speed_norm": vnorm,
-                "has_left": int(has_left),
-                "has_right": int(has_right),
+                "has_left": 1,
+                "has_right": 1,
                 "L": int(L),
+                "bridge_mode_relaxed": mode_relaxed,
             }
+            continue
 
-    # safety: only apply inside low frames, and make them disjoint
+        # helper: safe-bridge eligibility
+        def _eligible_safe_bridge() -> bool:
+            if not (has_left and has_right):
+                return False
+            if L > safe_L:
+                return False
+            if disp_relax_max is not None and np.isfinite(dnorm):
+                if float(dnorm) > float(disp_relax_max):
+                    return False
+            return True
+
+        # ---- Speed gate: prefer safe-bridge (not abstain)
+        if cfg.use_speed and (speed_thr is not None) and np.isfinite(vnorm):
+            if float(vnorm) > float(speed_thr):
+                if _eligible_safe_bridge():
+                    force_safe[t0:t1 + 1] = True
+                    decisions[int(seg_id)] = {
+                        "decision": "force_safe_bridge",
+                        "reason": "speed_too_large",
+                        "boundary_disp_norm": dnorm,
+                        "speed_norm": vnorm,
+                        "has_left": int(has_left),
+                        "has_right": int(has_right),
+                        "L": int(L),
+                        "bridge_mode_relaxed": mode_relaxed,
+                    }
+                    continue
+                else:
+                    force_abst[t0:t1 + 1] = True
+                    decisions[int(seg_id)] = {
+                        "decision": "force_abstain",
+                        "reason": "speed_too_large",
+                        "boundary_disp_norm": dnorm,
+                        "speed_norm": vnorm,
+                        "has_left": int(has_left),
+                        "has_right": int(has_right),
+                        "L": int(L),
+                    }
+                    continue
+
+        # ---- Disp gate: safe-bridge if eligible else abstain
+        if (disp_thr is not None) and np.isfinite(dnorm):
+            if float(dnorm) > float(disp_thr):
+                if _eligible_safe_bridge():
+                    force_safe[t0:t1 + 1] = True
+                    decisions[int(seg_id)] = {
+                        "decision": "force_safe_bridge",
+                        "reason": "disp_relaxed",
+                        "boundary_disp_norm": dnorm,
+                        "speed_norm": vnorm,
+                        "has_left": int(has_left),
+                        "has_right": int(has_right),
+                        "L": int(L),
+                        "bridge_mode_relaxed": mode_relaxed,
+                    }
+                else:
+                    force_abst[t0:t1 + 1] = True
+                    decisions[int(seg_id)] = {
+                        "decision": "force_abstain",
+                        "reason": "disp_too_large",
+                        "boundary_disp_norm": dnorm,
+                        "speed_norm": vnorm,
+                        "has_left": int(has_left),
+                        "has_right": int(has_right),
+                        "L": int(L),
+                    }
+                continue
+
+        # ---- default: auto
+        decisions[int(seg_id)] = {
+            "decision": "auto",
+            "reason": "",
+            "boundary_disp_norm": dnorm,
+            "speed_norm": vnorm,
+            "has_left": int(has_left),
+            "has_right": int(has_right),
+            "L": int(L),
+        }
+
+    # safety: only apply inside low frames, disjoint
     force_abst = force_abst & low
-    force_safe_bridge = force_safe_bridge & low
-    force_safe_bridge = force_safe_bridge & (~force_abst)
-    return force_abst, force_safe_bridge, decisions
-
+    force_safe = force_safe & low
+    force_safe = force_safe & (~force_abst)
+    return force_abst, force_safe, decisions
 
 # ============================================================
 # Stage1
@@ -1229,6 +1274,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         use_speed=bool(sr_raw.get("use_speed", False)),
         speed_norm_q=float(sr_raw.get("speed_norm_q", 0.97)),
         speed_norm=sr_raw.get("speed_norm", None),
+        L_short=int(sr_raw.get("L_short", 2)),
 
         # NEW
         safe_bridge_max_len=int(sr_raw.get("safe_bridge_max_len", 8)),
@@ -1543,7 +1589,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         force_safe_bridge_mask = np.zeros_like(low_by_tau, dtype=bool)
         seg_route_decisions: Dict[int, Dict[str, Any]] = {}
 
-        if seg_route_cfg.enable and (seg_route_fit.disp_norm_thr is not None or seg_route_cfg.require_both_sides):
+        if seg_route_cfg.enable:
             try:
                 force_abst_mask, force_safe_bridge_mask, seg_route_decisions = _segment_routing_decide_masks(
                     low_by_tau=low_by_tau,
@@ -1572,7 +1618,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 low = low_by_tau  # segments are defined on low_by_tau
                 segs = _segments_from_mask(low)
 
-                def _linear_safe_bridge_segment(t0: int, t1: int, left: int, right: int) -> None:
+                def _safe_bridge_segment(t0: int, t1: int, left: int, right: int, mode: str) -> None:
                     # interpolate between z_obs[left] and z_obs[right] but only fill t0..t1
                     if left < 0 or right >= Tseq or right <= left:
                         return
@@ -1581,9 +1627,15 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     denom = float(right - left)
                     if denom <= 0:
                         return
+
+                    m = str(mode).lower()
                     for t in range(t0, t1 + 1):
                         a = float(t - left) / denom
                         a = float(np.clip(a, 0.0, 1.0))
+                        if m == "hermite_safe":
+                            # smoothstep: 3a^2 - 2a^3
+                            a = a * a * (3.0 - 2.0 * a)
+                        # default linear_safe
                         z_fin[t] = (1.0 - a) * zL + a * zR
 
                 def _safe_hold_segment(t0: int, t1: int, left: int, right: int, has_left: bool, has_right: bool) -> None:
@@ -1613,11 +1665,13 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                         is_abst[t0:t1 + 1] = True
                     elif seg_force_safe:
                         if has_left and has_right:
-                            _linear_safe_bridge_segment(t0, t1, left, right)
+                            _safe_bridge_segment(
+                                t0, t1, left, right,
+                                mode=str(getattr(seg_route_cfg, "bridge_mode_relaxed", "linear_safe")).lower()
+                            )
                             is_bridge[t0:t1 + 1] = True
                             is_abst[t0:t1 + 1] = False
                         else:
-                            # fallback: if boundaries missing, do safe-hold
                             _safe_hold_segment(t0, t1, left, right, has_left, has_right)
                             is_bridge[t0:t1 + 1] = False
                             is_abst[t0:t1 + 1] = True
