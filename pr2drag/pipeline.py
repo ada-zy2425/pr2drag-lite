@@ -6,6 +6,7 @@ import sys
 import math
 import platform
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
@@ -47,7 +48,7 @@ debug_seqs = set(
     s.strip()
     for s in os.environ.get(
         "PR2DRAG_DEBUG_AOB_SEQS",
-        "breakdance,horsejump-high,soapbox"
+        "breakdance,horsejump-high,soapbox",
     ).split(",")
     if s.strip()
 )
@@ -185,7 +186,7 @@ def _stage_signature(cfg: Dict[str, Any], stage: str) -> str:
         "stage1": cfg.get("stage1", {}),
         "stage2": cfg.get("stage2", {}),
         "stage3": cfg.get("stage3", {}),
-        "version": "0.3.1-lite-risk-wcalib-tieaware+reliability_ci_fix+oracle_segments_audit_v1",
+        "version": "0.3.1-lite-risk-wcalib-tieaware+reliability_ci_fix+oracle_segments_audit_v1+segment_routing_v1",
     }
     return sha1_of_dict(pick)
 
@@ -233,6 +234,263 @@ def _segments_from_mask(mask: np.ndarray) -> List[Tuple[int, int]]:
         k = min(len(starts), len(ends))
         starts, ends = starts[:k], ends[:k]
     return list(zip(starts, ends))
+
+
+# ============================================================
+# Segment-level routing (safety filter: bridge -> abstain only)
+# ============================================================
+@dataclass
+class _SegRoutingCfg:
+    enable: bool = False
+    mode: str = "train_quantile"          # fixed | train_quantile
+    disp_norm_q: float = 0.95             # used when mode=train_quantile
+    disp_norm: Optional[float] = None     # used when mode=fixed
+    Lmax: int = 10
+    require_both_sides: bool = True
+    use_speed: bool = False
+    speed_norm_q: float = 0.97
+    speed_norm: Optional[float] = None
+
+
+@dataclass
+class _SegRoutingFit:
+    disp_norm_thr: Optional[float] = None
+    speed_norm_thr: Optional[float] = None
+    n_segments: int = 0
+    n_valid_boundary: int = 0
+
+
+def _diag_from_hw(hw: np.ndarray) -> float:
+    hw = np.asarray(hw, dtype=np.float64).reshape(-1)
+    if hw.size >= 2:
+        h, w = float(hw[0]), float(hw[1])
+        return float(math.sqrt(h * h + w * w) + 1e-6)
+    return float("nan")
+
+
+def _fit_segment_routing_thresholds_train(
+    *,
+    npz_dir: Path,
+    cfg: _SegRoutingCfg,
+    tau_mode: str,
+    tau_global: float,
+    target_frac: float,
+    tau_min: float,
+    tau_max: float,
+    seq_post_w_raw_fn,   # callable(npz_path)->(w_raw,p,y)
+    w_to_wtil_fn,        # callable(w_raw)->wtil
+    analysis_dir: Path,
+) -> _SegRoutingFit:
+    """
+    Fit routing thresholds on TRAIN ONLY to avoid val leakage.
+    We use low-segments induced by (wtil < tau) and collect boundary_disp_norm / speed_norm.
+    """
+    fit = _SegRoutingFit()
+    if not cfg.enable:
+        return fit
+
+    dnorm_all: List[float] = []
+    vnorm_all: List[float] = []
+    nseg = 0
+    nvalid = 0
+
+    for npz_path in sorted(Path(npz_dir).glob("*.npz")):
+        arr, meta = npz_read(npz_path)
+
+        w_raw, _p, _y = seq_post_w_raw_fn(npz_path)
+        wtil = w_to_wtil_fn(w_raw)
+        if wtil.size == 0:
+            continue
+
+        if tau_mode == "per_video":
+            tau = float(np.quantile(wtil.astype(np.float64), target_frac))
+            tau = clamp(tau, tau_min, tau_max)
+        else:
+            tau = float(tau_global)
+
+        low = (wtil < tau)
+        segs = _segments_from_mask(low)
+        if len(segs) == 0:
+            continue
+
+        z_obs = arr.get("z_obs", None)
+        hw = arr.get("img_hw", None)
+        if z_obs is None or hw is None:
+            continue
+        z_obs = np.asarray(z_obs, dtype=np.float32)
+        diag = _diag_from_hw(hw)
+        if not np.isfinite(diag) or diag <= 0:
+            continue
+
+        for (t0, t1) in segs:
+            nseg += 1
+            L = int(t1 - t0 + 1)
+            left = t0 - 1
+            right = t1 + 1
+            has_left = (left >= 0) and (not bool(low[left]))
+            has_right = (right < int(wtil.size)) and (not bool(low[right]))
+
+            if cfg.require_both_sides and not (has_left and has_right):
+                continue
+            if not (has_left and has_right):
+                continue
+
+            dpx = float(np.linalg.norm((z_obs[left] - z_obs[right]).astype(np.float64)))
+            dnorm = float(dpx / diag)
+            if not np.isfinite(dnorm):
+                continue
+
+            nvalid += 1
+            dnorm_all.append(dnorm)
+
+            if cfg.use_speed:
+                vnorm_all.append(float(dnorm / max(L, 1)))
+
+    fit.n_segments = int(nseg)
+    fit.n_valid_boundary = int(nvalid)
+
+    mode = str(cfg.mode).lower()
+    if mode == "fixed":
+        fit.disp_norm_thr = None if cfg.disp_norm is None else float(cfg.disp_norm)
+        fit.speed_norm_thr = None if (not cfg.use_speed or cfg.speed_norm is None) else float(cfg.speed_norm)
+
+    elif mode == "train_quantile":
+        if len(dnorm_all) > 0:
+            q = float(np.clip(cfg.disp_norm_q, 0.0, 1.0))
+            fit.disp_norm_thr = float(np.quantile(np.asarray(dnorm_all, dtype=np.float64), q))
+        else:
+            fit.disp_norm_thr = None
+
+        if cfg.use_speed:
+            if len(vnorm_all) > 0:
+                qv = float(np.clip(cfg.speed_norm_q, 0.0, 1.0))
+                fit.speed_norm_thr = float(np.quantile(np.asarray(vnorm_all, dtype=np.float64), qv))
+            else:
+                fit.speed_norm_thr = None
+    else:
+        raise ValueError(f"[SegRouting] unknown mode={cfg.mode}, expected fixed|train_quantile")
+
+    # write fit audit
+    try:
+        write_json(analysis_dir / "segment_routing_fit_v1.json", {
+            "enable": bool(cfg.enable),
+            "mode": cfg.mode,
+            "disp_norm_q": float(cfg.disp_norm_q),
+            "disp_norm_thr": None if fit.disp_norm_thr is None else float(fit.disp_norm_thr),
+            "Lmax": int(cfg.Lmax),
+            "require_both_sides": bool(cfg.require_both_sides),
+            "use_speed": bool(cfg.use_speed),
+            "speed_norm_q": float(cfg.speed_norm_q),
+            "speed_norm_thr": None if fit.speed_norm_thr is None else float(fit.speed_norm_thr),
+            "n_segments_total": int(fit.n_segments),
+            "n_valid_boundary": int(fit.n_valid_boundary),
+        })
+    except Exception as e:
+        print(f"[Warn] failed to write segment_routing_fit_v1.json: {e}")
+
+    if fit.disp_norm_thr is None and not cfg.require_both_sides:
+        print("[SegRouting] no valid boundary segments on train -> routing likely no-op (disp_norm_thr=None)")
+    else:
+        if fit.disp_norm_thr is not None:
+            print(f"[SegRouting] fitted disp_norm_thr={fit.disp_norm_thr:.6f} (train-only)")
+        if cfg.use_speed and fit.speed_norm_thr is not None:
+            print(f"[SegRouting] fitted speed_norm_thr={fit.speed_norm_thr:.6f} (train-only)")
+        if cfg.require_both_sides:
+            print("[SegRouting] require_both_sides=True -> missing-boundary segments will be forced abstain")
+
+    return fit
+
+
+def _segment_routing_force_mask(
+    *,
+    low_by_tau: np.ndarray,
+    z_obs: np.ndarray,
+    img_hw: np.ndarray,
+    cfg: _SegRoutingCfg,
+    fit: _SegRoutingFit,
+) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]:
+    """
+    Decide which low segments should be forced to abstain.
+    Returns:
+      force_abst_mask: bool[T]
+      seg_decisions: seg_id -> {decision, reason, boundary_disp_norm, speed_norm}
+    """
+    low = np.asarray(low_by_tau, dtype=bool).reshape(-1)
+    T = int(low.size)
+    force = np.zeros((T,), dtype=bool)
+    segs = _segments_from_mask(low)
+
+    z_obs = np.asarray(z_obs, dtype=np.float32)
+    diag = _diag_from_hw(img_hw)
+
+    decisions: Dict[int, Dict[str, Any]] = {}
+    if not np.isfinite(diag) or diag <= 0:
+        for seg_id, (_t0, _t1) in enumerate(segs):
+            decisions[int(seg_id)] = {
+                "decision": "auto",
+                "reason": "bad_diag",
+                "boundary_disp_norm": float("nan"),
+                "speed_norm": float("nan"),
+            }
+        return force, decisions
+
+    for seg_id, (t0, t1) in enumerate(segs):
+        L = int(t1 - t0 + 1)
+        left = t0 - 1
+        right = t1 + 1
+        has_left = (left >= 0) and (not bool(low[left]))
+        has_right = (right < T) and (not bool(low[right]))
+
+        reasons: List[str] = []
+        dnorm = float("nan")
+        vnorm = float("nan")
+
+        if cfg.require_both_sides and not (has_left and has_right):
+            reasons.append("missing_boundary")
+            force[t0:t1 + 1] = True
+            decisions[int(seg_id)] = {
+                "decision": "force_abstain",
+                "reason": ",".join(reasons),
+                "boundary_disp_norm": dnorm,
+                "speed_norm": vnorm,
+            }
+            continue
+
+        if has_left and has_right:
+            dpx = float(np.linalg.norm((z_obs[left] - z_obs[right]).astype(np.float64)))
+            dnorm = float(dpx / diag)
+            vnorm = float(dnorm / max(L, 1))
+
+        if L > int(cfg.Lmax):
+            reasons.append("too_long")
+
+        if fit.disp_norm_thr is not None and np.isfinite(dnorm):
+            if float(dnorm) > float(fit.disp_norm_thr):
+                reasons.append("disp_too_large")
+
+        if cfg.use_speed and fit.speed_norm_thr is not None and np.isfinite(vnorm):
+            if float(vnorm) > float(fit.speed_norm_thr):
+                reasons.append("speed_too_large")
+
+        if len(reasons) > 0:
+            force[t0:t1 + 1] = True
+            decisions[int(seg_id)] = {
+                "decision": "force_abstain",
+                "reason": ",".join(reasons),
+                "boundary_disp_norm": dnorm,
+                "speed_norm": vnorm,
+            }
+        else:
+            decisions[int(seg_id)] = {
+                "decision": "auto",
+                "reason": "",
+                "boundary_disp_norm": dnorm,
+                "speed_norm": vnorm,
+            }
+
+    # safety: force mask should only apply inside low frames
+    force = force & low
+    return force, decisions
 
 
 # ============================================================
@@ -815,6 +1073,21 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     met_cfg = s3.get("metrics", {})
     ana_cfg = s3.get("analysis", {})
 
+    # --- Segment routing config (safety filter)
+    sr_raw = dict(s3.get("segment_routing", {}))
+    seg_route_cfg = _SegRoutingCfg(
+        enable=bool(sr_raw.get("enable", False)),
+        mode=str(sr_raw.get("mode", "train_quantile")).lower(),
+        disp_norm_q=float(sr_raw.get("disp_norm_q", 0.95)),
+        disp_norm=sr_raw.get("disp_norm", None),
+        Lmax=int(sr_raw.get("Lmax", 10)),
+        require_both_sides=bool(sr_raw.get("require_both_sides", True)),
+        use_speed=bool(sr_raw.get("use_speed", False)),
+        speed_norm_q=float(sr_raw.get("speed_norm_q", 0.97)),
+        speed_norm=sr_raw.get("speed_norm", None),
+    )
+    seg_route_fit = _SegRoutingFit()
+
     tau_mode = str(s3.get("tau_mode", "global")).lower()
     target_frac = float(s3.get("tau_target_frac", 0.25))
     tau_min = float(s3.get("tau_min", 1e-6))
@@ -839,7 +1112,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     oracle_enable = bool(oracle_cfg.get("enable", False))
     oracle_source = str(oracle_cfg.get("source", "y")).lower()  # y | err
     oracle_tau = float(oracle_cfg.get("tau", 0.5))
-    oracle_err_px = float(oracle_cfg.get("err_px", met_cfg.get("fail_px", 50.0))) 
+    oracle_err_px = float(oracle_cfg.get("err_px", met_cfg.get("fail_px", 50.0)))
+
     if oracle_enable:
         if tau_mode != "oracle":
             print(f"[Oracle] overriding tau_mode={tau_mode} -> tau fixed to oracle_tau={oracle_tau}")
@@ -847,7 +1121,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         if wc_enable:
             print("[Oracle] disabling w_calibration (oracle overrides wtil anyway).")
         wc_enable = False
-
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -905,9 +1178,10 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         print("[Feat] scaling disabled")
 
     clf = fit_emission_model(
-        X_tr_k, y_tr,
+        X_tr_k,
+        y_tr,
         c=float(em_cfg.get("c", 1.0)),
-        max_iter=int(em_cfg.get("max_iter", 2000))
+        max_iter=int(em_cfg.get("max_iter", 2000)),
     )
 
     p_tr_raw = clf.predict_proba(X_tr_k)[:, 1].astype(np.float32)
@@ -963,7 +1237,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             if bool(ana_cfg.get("write_figs", True)):
                 wtil = wcal.transform(w_all)
                 _plot_reliability(
-                    wtil, y_all,
+                    wtil,
+                    y_all,
                     out_path=analysis_dir / "fig_reliability_train_wcalib.png",
                     title="Reliability curve on train (after w calibration)",
                     xlabel="wtil bin center (calibrated)",
@@ -1006,7 +1281,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         y_all = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
 
         tau_global, summ, curve = _select_tau_risk_constrained_tieaware(
-            w_all, y_all, r0=r0, min_keep_frac=min_keep_frac, tau_min=tau_min, tau_max=tau_max
+            w_all,
+            y_all,
+            r0=r0,
+            min_keep_frac=min_keep_frac,
+            tau_min=tau_min,
+            tau_max=tau_max,
         )
         print(
             f"[Tau] risk-constrained: tau_global={tau_global:.6f}  "
@@ -1035,6 +1315,21 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         tau_global = float("nan")
     else:
         raise ValueError("Unknown tau_mode. Use: oracle | global | risk | per_video")
+
+    # ---- Fit segment-routing thresholds on TRAIN ONLY (after tau is decided)
+    if seg_route_cfg.enable:
+        seg_route_fit = _fit_segment_routing_thresholds_train(
+            npz_dir=Path(stage2_train),
+            cfg=seg_route_cfg,
+            tau_mode=tau_mode,
+            tau_global=float(tau_global) if np.isfinite(tau_global) else float("nan"),
+            target_frac=float(target_frac),
+            tau_min=float(tau_min),
+            tau_max=float(tau_max),
+            seq_post_w_raw_fn=_seq_post_w_raw,
+            w_to_wtil_fn=_w_to_wtil,
+            analysis_dir=analysis_dir,
+        )
 
     rows = []
     seg_rows: List[Dict[str, Any]] = []
@@ -1073,7 +1368,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         else:
             raise ValueError(f"Unknown tau_mode={tau_mode}")
 
-
         # --- NEW: oracle override (mechanism validation)
         if oracle_enable:
             if oracle_source == "y":
@@ -1092,10 +1386,53 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             tau = float(oracle_tau)
 
         seg_debug = [] if (debug_aob and seq in debug_seqs) else None
+
+        # --- Segment routing decisions computed BEFORE AoB (for auditing),
+        # but applied AFTER base AoB as a safety override.
+        low_by_tau = (wtil < float(tau))
+        force_abst_mask = np.zeros_like(low_by_tau, dtype=bool)
+        seg_route_decisions: Dict[int, Dict[str, Any]] = {}
+        if seg_route_cfg.enable and (seg_route_fit.disp_norm_thr is not None or seg_route_cfg.require_both_sides):
+            try:
+                force_abst_mask, seg_route_decisions = _segment_routing_force_mask(
+                    low_by_tau=low_by_tau,
+                    z_obs=z_obs,
+                    img_hw=arr.get("img_hw", np.array([0, 0], dtype=np.int32)),
+                    cfg=seg_route_cfg,
+                    fit=seg_route_fit,
+                )
+            except Exception as e:
+                print(f"[SegRouting] failed on seq={seq}: {e} -> disabled for this seq")
+                force_abst_mask = np.zeros_like(low_by_tau, dtype=bool)
+                seg_route_decisions = {}
+
+        # --- Base AoB run (original behavior)
         z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=wtil, tau=tau, params=aobp, debug=seg_debug)
 
+        # --- Safety override: for flagged segments, replace with HOLD-only output
+        if seg_route_cfg.enable and bool(np.any(force_abst_mask)):
+            try:
+                aobp_hold = AoBParams(
+                    eps_gate=1.01,  # never bridge
+                    abstain_mode="hold",
+                    eta_L=aobp.eta_L,
+                    eta_u=aobp.eta_u,
+                    max_bridge_len=0,
+                    bridge_mode=aobp.bridge_mode,
+                    hermite_scan=aobp.hermite_scan,
+                    clamp_hermite=aobp.clamp_hermite,
+                    clamp_margin_px=aobp.clamp_margin_px,
+                )
+                z_hold, _, is_abst_hold = aob_fill(z_base=z_obs, w=wtil, tau=tau, params=aobp_hold, debug=None)
+                z_fin[force_abst_mask] = z_hold[force_abst_mask]
+                is_bridge[force_abst_mask] = False
+                is_abst[force_abst_mask] = True
+                # NOTE: is_abst_hold computed but not strictly needed; keep for clarity / future audit use.
+                _ = is_abst_hold
+            except Exception as e:
+                print(f"[SegRouting] hold-override failed on seq={seq}: {e} -> keep base AoB output")
+
         # --- NEW: segment-level audit table (one row per low segment)
-        low_by_tau = (wtil < float(tau))
         low_by_aob = (is_bridge | is_abst)
         if low_by_tau.shape != low_by_aob.shape:
             raise ValueError(f"[Audit] mask shape mismatch for seq={seq}: {low_by_tau.shape} vs {low_by_aob.shape}")
@@ -1108,6 +1445,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         if len(segs) > 0:
             err_obs = np.linalg.norm((z_obs - z_gt).astype(np.float64), axis=1)
             err_fin = np.linalg.norm((z_fin - z_gt).astype(np.float64), axis=1)
+            diag = _diag_from_hw(arr.get("img_hw", np.array([0, 0], dtype=np.int32)))
 
             for seg_id, (t0, t1) in enumerate(segs):
                 L = int(t1 - t0 + 1)
@@ -1134,10 +1472,17 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     bd_obs = float("nan")
                     bd_fin = float("nan")
 
+                bd_obs_norm = float(bd_obs / diag) if (np.isfinite(bd_obs) and np.isfinite(diag) and diag > 0) else float("nan")
+                v_norm = float(bd_obs_norm / max(L, 1)) if np.isfinite(bd_obs_norm) else float("nan")
+
                 seg_err_obs = err_obs[t0:t1 + 1]
                 seg_err_fin = err_fin[t0:t1 + 1]
                 seg_fail_obs = float(np.mean(seg_err_obs > float(fail_px))) if seg_err_obs.size else float("nan")
                 seg_fail_fin = float(np.mean(seg_err_fin > float(fail_px))) if seg_err_fin.size else float("nan")
+
+                route_info = seg_route_decisions.get(int(seg_id), {})
+                route_decision = str(route_info.get("decision", "auto"))
+                route_reason = str(route_info.get("reason", ""))
 
                 seg_rows.append({
                     "seq": seq,
@@ -1154,6 +1499,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     "has_right": int(has_right),
                     "boundary_disp_obs": bd_obs,
                     "boundary_disp_fin": bd_fin,
+                    "boundary_disp_obs_norm": bd_obs_norm,
+                    "speed_norm": v_norm,
+                    "route_decision": route_decision,
+                    "route_reason": route_reason,
+                    "route_disp_norm_thr": None if seg_route_fit.disp_norm_thr is None else float(seg_route_fit.disp_norm_thr),
+                    "route_Lmax": int(seg_route_cfg.Lmax),
                     "w_min": float(np.min(wtil[t0:t1 + 1])) if L > 0 else float("nan"),
                     "w_mean": float(np.mean(wtil[t0:t1 + 1])) if L > 0 else float("nan"),
                     "p_mean": float(np.mean(p[t0:t1 + 1])) if L > 0 else float("nan"),
@@ -1177,8 +1528,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
             pbar.write(
                 f"[AoB-Debug] seq={seq} tau={tau:.6f} "
-                f"wtil[q0,q1,q5,q50,q95,q99,q100]={['%.4f'%v for v in q]} "
-                f"low_frac={low_n/max(Tseq,1):.4f} low_n={low_n} segs={0 if seg_debug is None else len(seg_debug)}"
+                f"wtil[q0,q1,q5,q50,q95,q99,q100]={['%.4f' % v for v in q]} "
+                f"low_frac={low_n / max(Tseq, 1):.4f} low_n={low_n} segs={0 if seg_debug is None else len(seg_debug)}"
             )
             if low_n > 0:
                 pbar.write(
@@ -1254,7 +1605,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 )
                 summ = (
                     seg_df2
-                    .groupby(["type", "L_bucket"], dropna=False)
+                    .groupby(["type", "L_bucket"], dropna=False, observed=False)
                     .agg(
                         n=("L", "count"),
                         fin_p95=("seg_fin_p95", "mean"),
@@ -1301,7 +1652,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
         if wcat.size == ycat.size and wcat.size > 0:
             _plot_reliability(
-                wcat, ycat,
+                wcat,
+                ycat,
                 out_path=analysis_dir / "fig_gate_bins_val.png",
                 title="Gate bins (reliability semantics, val)",
                 xlabel="wtil bin center",
