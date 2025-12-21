@@ -91,3 +91,14 @@ stage3:
       pack_root: "_paperpack"   # 相对 base_out；也可以写绝对路径
       zip: true
       copy_out_dir: false       # 默认只打包 _analysis；如想把整个 out_dir 也复制进去就改 true
+
+  segment_routing:
+    enable: true
+    mode: train_quantile          # fixed | train_quantile
+    disp_norm_q: 0.95             # 训练集上 boundary_disp_norm 的分位数阈值
+    disp_norm: null               # mode=fixed 时用这个（0~1 归一化）
+    Lmax: 10                      # 段长度阈值，默认建议 <= max_bridge_len
+    require_both_sides: true      # 没有左右边界就强制 abstain（更安全）
+    use_speed: false
+    speed_norm_q: 0.97
+    speed_norm: null
