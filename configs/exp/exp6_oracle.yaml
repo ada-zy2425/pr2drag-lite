@@ -23,7 +23,7 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_exp6_oracle_tau05"
+  out_dir: "davis2016_E6_oracle_tau05"
 
   tau_mode: risk
   tau_risk: 0.02

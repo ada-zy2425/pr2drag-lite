@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import math
+import json
 import platform
 import subprocess
 from dataclasses import dataclass
@@ -15,7 +16,10 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-import matplotlib.pyplot as plt
+# --- robust headless plotting (CLI/Colab-safe when saving figs)
+import matplotlib
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt  # noqa: E402
 
 from .aob import AoBParams, aob_fill
 from .evidence import build_sequence_evidence
@@ -34,7 +38,7 @@ from .utils import (
     npz_write,
     pretty_header,
     read_txt_lines,
-    resolve_davis_root,
+    resolve_davis_root,  # keep import for compatibility; we use local fallback too.
     safe_mkdir,
     sha1_of_dict,
     write_json,
@@ -58,6 +62,12 @@ debug_seqs = set(
 # DAVIS helpers
 # ============================================================
 def _resolve_davis_root(davis_root: Union[str, Path]) -> Path:
+    """
+    More defensive resolver than utils.resolve_davis_root.
+    Accepts:
+      - exact DAVIS root containing JPEGImages/Annotations/ImageSets
+      - parent that contains DAVIS/ with those subdirs
+    """
     p = Path(davis_root).expanduser()
     if str(p).strip() == "":
         raise ValueError("[DAVIS] davis_root is empty. Please set cfg['davis_root'] correctly.")
@@ -236,6 +246,49 @@ def _segments_from_mask(mask: np.ndarray) -> List[Tuple[int, int]]:
     return list(zip(starts, ends))
 
 
+def _read_meta_json(path: Path) -> Dict[str, Any]:
+    """
+    Robust meta.json reader.
+    - avoids pandas JSON quirks
+    - returns {} on missing
+    """
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+        return {"_raw": obj}
+    except Exception as e:
+        raise RuntimeError(f"[Meta] failed to read json: {path} ({e})") from e
+
+
+def _npz_read_safe(npz_path: Path, *, context: str = "") -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    """
+    Wrap utils.npz_read with more actionable error messages for common corruption / mismatch cases.
+    """
+    try:
+        arr, meta = npz_read(npz_path)
+        if not isinstance(arr, dict) or not isinstance(meta, dict):
+            raise ValueError("npz_read did not return (dict, dict)")
+        return arr, meta
+    except Exception as e:
+        msg = (
+            f"[NPZ] failed to read npz: {npz_path}\n"
+            f"  context: {context}\n"
+            f"  error: {type(e).__name__}: {e}\n"
+            "  likely causes:\n"
+            "    - Stage1 interrupted -> wrote a partial/corrupt .npz\n"
+            "    - file size is 0 or upload/drive sync truncated it\n"
+            "    - mixing old/new cache signature with incompatible npz schema\n"
+            "  fixes:\n"
+            "    1) delete the bad file and rerun Stage1 for that split\n"
+            "    2) if many are bad, delete the whole stage1 output dir and rerun\n"
+        )
+        raise RuntimeError(msg) from e
+
+
 # ============================================================
 # Segment-level routing (safety filter: bridge -> abstain only)
 # ============================================================
@@ -295,7 +348,7 @@ def _fit_segment_routing_thresholds_train(
     nvalid = 0
 
     for npz_path in sorted(Path(npz_dir).glob("*.npz")):
-        arr, meta = npz_read(npz_path)
+        arr, _meta = _npz_read_safe(npz_path, context="fit_segment_routing_thresholds_train")
 
         w_raw, _p, _y = seq_post_w_raw_fn(npz_path)
         wtil = w_to_wtil_fn(w_raw)
@@ -497,7 +550,12 @@ def _segment_routing_force_mask(
 # Stage1
 # ============================================================
 def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -> Dict[str, Any]:
-    davis_root = resolve_davis_root(cfg["davis_root"])
+    # use local robust resolver; keep utils.resolve_davis_root compatibility as fallback
+    try:
+        davis_root = _resolve_davis_root(cfg["davis_root"])
+    except Exception:
+        davis_root = resolve_davis_root(cfg["davis_root"])
+
     res = cfg["res"]
     seqs = _list_seq_from_split(davis_root, cfg["splits"][split])
 
@@ -577,6 +635,16 @@ def stage1_precompute_split(cfg: Dict[str, Any], *, split: str, out_dir: Path) -
 # Stage2
 # ============================================================
 def stage2_build_features_for_seq(arr: Dict[str, np.ndarray], *, feat_mode: str) -> np.ndarray:
+    # schema checks (better error than KeyError downstream)
+    need = ["iou_shift", "cycle_err", "area_change", "occl_flag", "blur_flag", "blur_inv", "motion", "img_hw"]
+    missing = [k for k in need if k not in arr]
+    if missing:
+        raise KeyError(
+            f"[Stage2] missing keys in Stage1 npz: {missing}\n"
+            "  likely you are mixing an older Stage1 cache with the new pipeline.\n"
+            "  fix: delete stage1 output dir and rerun Stage1."
+        )
+
     iou_shift = arr["iou_shift"].astype(np.float32)
     cycle_err = arr["cycle_err"].astype(np.float32)
     area_change = arr["area_change"].astype(np.float32)
@@ -612,10 +680,9 @@ def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, o
     sig = _stage_signature(cfg, stage=f"stage2-{split}-feat{feat_mode}")
 
     meta_path = stage1_dir / "meta.json"
-    if meta_path.exists():
-        meta = pd.read_json(meta_path, typ="series").to_dict()  # type: ignore
-        seqs = list(meta.get("seqs", []))
-    else:
+    meta = _read_meta_json(meta_path) if meta_path.exists() else {}
+    seqs = list(meta.get("seqs", [])) if isinstance(meta.get("seqs", []), list) else []
+    if not seqs:
         seqs = sorted([p.stem for p in stage1_dir.glob("*.npz")])
 
     pbar = tqdm(seqs, desc=f"Stage2({split})")
@@ -626,17 +693,24 @@ def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, o
             raise FileNotFoundError(f"[Stage2] Missing Stage1 npz: {in_npz}")
 
         if cache and out_npz.exists():
-            _, m = npz_read(out_npz)
-            if m.get("signature", "") == sig and m.get("feat_mode", "") == feat_mode:
+            _arr2, m2 = _npz_read_safe(out_npz, context="stage2 cache check")
+            if m2.get("signature", "") == sig and m2.get("feat_mode", "") == feat_mode:
                 pbar.write(f"[skip] Stage2 exists (compatible): {out_npz.name}")
                 continue
             else:
                 pbar.write(f"[recompute] Stage2 stale/mismatch -> {out_npz.name}")
 
-        arr, _m1 = npz_read(in_npz)
+        arr, _m1 = _npz_read_safe(in_npz, context="stage2 read stage1 npz")
         X = stage2_build_features_for_seq(arr, feat_mode=feat_mode)
+
+        if "y" not in arr:
+            raise KeyError(
+                f"[Stage2] Stage1 npz missing y: {in_npz}\n"
+                "  fix: delete stage1 cache and rerun Stage1."
+            )
+
         y = arr["y"].astype(np.uint8)
-        err_obs = arr["err_obs"].astype(np.float32)
+        err_obs = arr.get("err_obs", np.zeros((y.shape[0],), dtype=np.float32)).astype(np.float32)
 
         arrays = {
             "X": X,
@@ -649,14 +723,18 @@ def stage2_compute_split(cfg: Dict[str, Any], *, split: str, stage1_dir: Path, o
         meta2 = {"seq": seq, "T": int(X.shape[0]), "feat_mode": feat_mode, "signature": sig}
         npz_write(out_npz, arrays=arrays, meta=meta2)
 
-    out_meta = {"split": split, "signature": sig, "feat_mode": feat_mode, "num_seqs": len(seqs)}
+    out_meta = {"split": split, "signature": sig, "feat_mode": feat_mode, "num_seqs": len(seqs), "seqs": seqs}
+    try:
+        write_json(out_dir / "meta.json", out_meta)
+    except Exception as e:
+        print(f"[Warn] failed to write Stage2 meta.json: {e}")
     return out_meta
 
 
 def _concat_stage2(npz_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     Xs, ys, errs = [], [], []
     for p in sorted(Path(npz_dir).glob("*.npz")):
-        arr, _ = npz_read(p)
+        arr, _ = _npz_read_safe(p, context="_concat_stage2")
         if "X" not in arr:
             continue
         Xs.append(arr["X"])
@@ -1205,7 +1283,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     print(f"[Emission] AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  risk@50%={m['risk@50%']:.4f}")
 
     def _seq_post_w_raw(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        arr, _ = npz_read(npz_path)
+        arr, _meta = _npz_read_safe(npz_path, context="_seq_post_w_raw")
         X = arr["X"][:, keep].astype(np.float32)
         if sc_enable and scaler is not None:
             X = _robust_iqr_apply(X, scaler, clip=sc_clip)
@@ -1343,7 +1421,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
     pbar = tqdm(sorted(Path(stage2_val).glob("*.npz")), desc="Stage3(val)")
     for npz_path in pbar:
-        arr, meta = npz_read(npz_path)
+        arr, meta = _npz_read_safe(npz_path, context="stage3 val read")
         seq = meta.get("seq", npz_path.stem)
 
         X = arr["X"][:, keep].astype(np.float32)
@@ -1427,7 +1505,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 z_fin[force_abst_mask] = z_hold[force_abst_mask]
                 is_bridge[force_abst_mask] = False
                 is_abst[force_abst_mask] = True
-                # NOTE: is_abst_hold computed but not strictly needed; keep for clarity / future audit use.
                 _ = is_abst_hold
             except Exception as e:
                 print(f"[SegRouting] hold-override failed on seq={seq}: {e} -> keep base AoB output")
@@ -1704,7 +1781,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 # CLI entry
 # ============================================================
 def run_all(cfg: Dict[str, Any]) -> None:
-    davis_root = resolve_davis_root(cfg["davis_root"])
+    # keep old behavior but prefer the robust resolver first
+    try:
+        davis_root = _resolve_davis_root(cfg["davis_root"])
+    except Exception:
+        davis_root = resolve_davis_root(cfg["davis_root"])
+
     base_out = Path(cfg["base_out"])
     res = cfg["res"]
 
