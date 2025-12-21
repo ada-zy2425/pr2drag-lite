@@ -839,9 +839,15 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     oracle_enable = bool(oracle_cfg.get("enable", False))
     oracle_source = str(oracle_cfg.get("source", "y")).lower()  # y | err
     oracle_tau = float(oracle_cfg.get("tau", 0.5))
-    oracle_err_px = float(oracle_cfg.get("err_px", met_cfg.get("fail_px", 50.0)))  # used when source=err
+    oracle_err_px = float(oracle_cfg.get("err_px", met_cfg.get("fail_px", 50.0))) 
     if oracle_enable:
-        print(f"[Oracle] enabled source={oracle_source} tau={oracle_tau} err_px={oracle_err_px}")
+        if tau_mode != "oracle":
+            print(f"[Oracle] overriding tau_mode={tau_mode} -> tau fixed to oracle_tau={oracle_tau}")
+        tau_mode = "oracle"
+        if wc_enable:
+            print("[Oracle] disabling w_calibration (oracle overrides wtil anyway).")
+        wc_enable = False
+
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -973,7 +979,11 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
     tau_global: float = 0.5
 
-    if tau_mode == "global":
+    if tau_mode == "oracle":
+        tau_global = clamp(float(oracle_tau), tau_min, tau_max)
+        print(f"[Tau] oracle-fixed: tau_global={tau_global:.6f}")
+
+    elif tau_mode == "global":
         ws = []
         for pth in sorted(Path(stage2_train).glob("*.npz")):
             w_raw, _, _ = _seq_post_w_raw(pth)
@@ -1024,7 +1034,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         print("[Tau] per_video mode enabled (legacy).")
         tau_global = float("nan")
     else:
-        raise ValueError("Unknown tau_mode. Use: global | risk | per_video")
+        raise ValueError("Unknown tau_mode. Use: oracle | global | risk | per_video")
 
     rows = []
     seg_rows: List[Dict[str, Any]] = []
@@ -1055,13 +1065,14 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         w_raw = forward_backward_binary(p, hmm).astype(np.float32)
         wtil = _w_to_wtil(w_raw)
 
-        if tau_mode in ("global", "risk"):
+        if tau_mode in ("oracle", "global", "risk"):
             tau = float(tau_global)
         elif tau_mode == "per_video":
             tau = float(np.quantile(wtil.astype(np.float64), target_frac)) if wtil.size else 0.5
             tau = clamp(tau, tau_min, tau_max)
         else:
             raise ValueError(f"Unknown tau_mode={tau_mode}")
+
 
         # --- NEW: oracle override (mechanism validation)
         if oracle_enable:

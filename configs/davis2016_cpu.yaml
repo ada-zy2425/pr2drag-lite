@@ -68,7 +68,7 @@ stage3:
 
   aob:
     abstain_mode: linear
-    max_bridge_len: 40   
+    max_bridge_len: 0 
     eps_gate: 0.0   
     eta_L: 0.0           
     eta_u: 0.0       
