@@ -1,0 +1,104 @@
+seed: 0
+
+davis_root: "/content/drive/MyDrive/DAVIS_unzipped/DAVIS"
+res: "480p"
+base_out: "/content/drive/MyDrive/pr2drag_data"
+
+splits:
+  train: "ImageSets/480p/train.txt"
+  val: "ImageSets/480p/val.txt"
+
+stage1:
+  cache: true
+  label_err_thresh: 50.0
+  noise:
+    base_sigma: 4.0
+    occl_sigma: 220.0
+    blur_sigma: 120.0
+    motion_sigma: 0.35
+    seed_offset: 123
+
+stage2:
+  cache: true
+  feat_mode: "b"
+
+
+stage3:
+  out_dir: "davis2016_E0c_seg_on_no_wcalib_risk0005"
+
+  # --- tau selection ---
+  tau_mode: "risk"
+  tau_risk: 0.005
+  tau_target_frac: 0.10
+  tau_min_keep_frac: 0.05
+  tau_min: 1e-6
+  tau_max: 0.999999
+
+  # --- posterior calibration (wtil) ---
+  w_calibration:
+    enable: false
+
+  # --- feature scaling ---
+  feature_scaler:
+    enable: true
+    type: "robust_iqr"
+    clip: 8.0
+    eps: 1e-6
+
+  # --- HMM prior ---
+  hmm:
+    prior_good: 0.85
+    p_stay_good: 0.92
+    p_stay_bad: 0.92
+    eps: 1e-3
+
+  # --- emission head ---
+  emission:
+    scaler:
+      enable: true
+      clip: 8.0
+    calibration:
+      enable: true
+      eps: 1e-6
+
+  # --- oracle (must be off for mainline) ---
+  oracle:
+    enable: false
+
+
+  # --- AoB policy ---
+  aob:
+    abstain_mode: "linear"
+
+    # allow bridging
+    max_bridge_len: 999
+
+    # gating (kept neutral here; routing decides)
+    eps_gate: 0.0
+    eta_L: 0.0
+    eta_u: 0.0
+
+    # current bridge implementation
+    bridge_mode: "hermite"
+    hermite_scan: 6
+    clamp_hermite: true
+    clamp_margin_px: 0.0
+
+  # --- failure metric ---
+  metrics:
+    fail_px: 50.0
+
+  # --- analysis artifacts ---
+  analysis:
+    write_csv: true
+    write_figs: true
+    log_to_file: true
+    archive:
+      enable: true
+      pack_root: "_paperpack"
+      zip: true
+      copy_out_dir: false
+
+  # --- segment routing ---
+  segment_routing:
+    enable: true
