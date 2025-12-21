@@ -1828,6 +1828,8 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                     "L": int(L),
                     "type": seg_type,
                     "bridge_n": int(b_n),
+                    "bridge_mode_req": str(route_info.get("bridge_mode_req", "")),
+                    "bridge_mode_eff": str(route_info.get("bridge_mode_eff", "")),
                     "abst_n": int(a_n),
                     "has_left": int(has_left),
                     "has_right": int(has_right),
