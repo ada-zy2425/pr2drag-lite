@@ -1,4 +1,4 @@
-# pr2drag/pipeline.py
+
 from __future__ import annotations
 
 import os
@@ -298,12 +298,21 @@ class _SegRoutingCfg:
     mode: str = "train_quantile"          # fixed | train_quantile
     disp_norm_q: float = 0.95             # used when mode=train_quantile
     disp_norm: Optional[float] = None     # used when mode=fixed
+
+    # hard constraints
     Lmax: int = 10
     require_both_sides: bool = True
+
+    # optional speed gate
     use_speed: bool = False
     speed_norm_q: float = 0.97
     speed_norm: Optional[float] = None
 
+    # ---- NEW: soft decision for disp_too_large ----
+    # if disp_too_large but segment is short and has both boundaries, we can do safe-bridge instead of abstain
+    safe_bridge_max_len: int = 8          # L <= this => eligible for safe-bridge
+    disp_relax_max: Optional[float] = 0.40  # if not None, require dnorm <= this for safe-bridge
+    bridge_mode_relaxed: str = "linear_safe"  # currently only linear_safe implemented
 
 @dataclass
 class _SegRoutingFit:
@@ -453,39 +462,56 @@ def _fit_segment_routing_thresholds_train(
 
     return fit
 
-
-def _segment_routing_force_mask(
+def _segment_routing_decide_masks(
     *,
     low_by_tau: np.ndarray,
     z_obs: np.ndarray,
     img_hw: np.ndarray,
     cfg: _SegRoutingCfg,
     fit: _SegRoutingFit,
-) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, Dict[str, Any]]]:
     """
-    Decide which low segments should be forced to abstain.
+    Decide per-low-segment action:
+      - force_abst_mask: frames to override with safe-hold abstain
+      - force_safe_bridge_mask: frames to override with linear_safe bridge
     Returns:
-      force_abst_mask: bool[T]
-      seg_decisions: seg_id -> {decision, reason, boundary_disp_norm, speed_norm}
+      (force_abst_mask, force_safe_bridge_mask, seg_decisions)
+    seg_decisions[seg_id] includes:
+      decision: auto | force_abstain | force_safe_bridge
+      reason:   missing_boundary | too_long | disp_too_large | speed_too_large | disp_relaxed | bad_diag | ...
+      boundary_disp_norm, speed_norm, has_left, has_right, L
     """
     low = np.asarray(low_by_tau, dtype=bool).reshape(-1)
     T = int(low.size)
-    force = np.zeros((T,), dtype=bool)
+
+    force_abst = np.zeros((T,), dtype=bool)
+    force_safe_bridge = np.zeros((T,), dtype=bool)
+
     segs = _segments_from_mask(low)
 
     z_obs = np.asarray(z_obs, dtype=np.float32)
     diag = _diag_from_hw(img_hw)
 
     decisions: Dict[int, Dict[str, Any]] = {}
+
     if not np.isfinite(diag) or diag <= 0:
-        for seg_id, (_t0, _t1) in enumerate(segs):
+        for seg_id, (t0, t1) in enumerate(segs):
             decisions[int(seg_id)] = {
                 "decision": "auto",
                 "reason": "bad_diag",
                 "boundary_disp_norm": float("nan"),
                 "speed_norm": float("nan"),
+                "has_left": int(0),
+                "has_right": int(0),
+                "L": int(t1 - t0 + 1),
             }
-        return force, decisions
+        return force_abst, force_safe_bridge, decisions
+
+    disp_thr = None if fit.disp_norm_thr is None else float(fit.disp_norm_thr)
+    speed_thr = None if fit.speed_norm_thr is None else float(fit.speed_norm_thr)
+    safe_L = int(getattr(cfg, "safe_bridge_max_len", 8))
+    disp_relax_max = getattr(cfg, "disp_relax_max", None)
+    disp_relax_max = None if disp_relax_max is None else float(disp_relax_max)
 
     for seg_id, (t0, t1) in enumerate(segs):
         L = int(t1 - t0 + 1)
@@ -494,44 +520,79 @@ def _segment_routing_force_mask(
         has_left = (left >= 0) and (not bool(low[left]))
         has_right = (right < T) and (not bool(low[right]))
 
-        reasons: List[str] = []
+        # compute boundary disp if possible
         dnorm = float("nan")
         vnorm = float("nan")
-
-        if cfg.require_both_sides and not (has_left and has_right):
-            reasons.append("missing_boundary")
-            force[t0:t1 + 1] = True
-            decisions[int(seg_id)] = {
-                "decision": "force_abstain",
-                "reason": ",".join(reasons),
-                "boundary_disp_norm": dnorm,
-                "speed_norm": vnorm,
-            }
-            continue
-
         if has_left and has_right:
             dpx = float(np.linalg.norm((z_obs[left] - z_obs[right]).astype(np.float64)))
             dnorm = float(dpx / diag)
             vnorm = float(dnorm / max(L, 1))
 
-        if L > int(cfg.Lmax):
-            reasons.append("too_long")
+        reasons: List[str] = []
 
-        if fit.disp_norm_thr is not None and np.isfinite(dnorm):
-            if float(dnorm) > float(fit.disp_norm_thr):
-                reasons.append("disp_too_large")
-
-        if cfg.use_speed and fit.speed_norm_thr is not None and np.isfinite(vnorm):
-            if float(vnorm) > float(fit.speed_norm_thr):
-                reasons.append("speed_too_large")
-
-        if len(reasons) > 0:
-            force[t0:t1 + 1] = True
+        # (A) missing boundary (if required) -> abstain
+        if cfg.require_both_sides and not (has_left and has_right):
+            reasons.append("missing_boundary")
+            force_abst[t0:t1 + 1] = True
             decisions[int(seg_id)] = {
                 "decision": "force_abstain",
                 "reason": ",".join(reasons),
                 "boundary_disp_norm": dnorm,
                 "speed_norm": vnorm,
+                "has_left": int(has_left),
+                "has_right": int(has_right),
+                "L": int(L),
+            }
+            continue
+
+        # (B) too long -> abstain
+        if L > int(cfg.Lmax):
+            reasons.append("too_long")
+
+        # (C) speed gate -> abstain
+        if cfg.use_speed and speed_thr is not None and np.isfinite(vnorm):
+            if float(vnorm) > float(speed_thr):
+                reasons.append("speed_too_large")
+
+        # (D) disp gate -> either safe-bridge (if eligible) OR abstain
+        disp_bad = False
+        if disp_thr is not None and np.isfinite(dnorm):
+            if float(dnorm) > float(disp_thr):
+                disp_bad = True
+
+        if disp_bad:
+            # eligible for safe-bridge iff: has both boundaries, short segment, and optional relax cap
+            eligible = bool(has_left and has_right and (L <= safe_L))
+            if eligible and (disp_relax_max is not None) and np.isfinite(dnorm):
+                eligible = eligible and (float(dnorm) <= float(disp_relax_max))
+
+            if eligible and str(getattr(cfg, "bridge_mode_relaxed", "linear_safe")).lower() == "linear_safe":
+                # choose safe-bridge instead of abstain
+                force_safe_bridge[t0:t1 + 1] = True
+                decisions[int(seg_id)] = {
+                    "decision": "force_safe_bridge",
+                    "reason": "disp_relaxed",
+                    "boundary_disp_norm": dnorm,
+                    "speed_norm": vnorm,
+                    "has_left": int(has_left),
+                    "has_right": int(has_right),
+                    "L": int(L),
+                }
+                continue
+            else:
+                reasons.append("disp_too_large")
+
+        # If any hard reason exists -> abstain
+        if len(reasons) > 0:
+            force_abst[t0:t1 + 1] = True
+            decisions[int(seg_id)] = {
+                "decision": "force_abstain",
+                "reason": ",".join(reasons),
+                "boundary_disp_norm": dnorm,
+                "speed_norm": vnorm,
+                "has_left": int(has_left),
+                "has_right": int(has_right),
+                "L": int(L),
             }
         else:
             decisions[int(seg_id)] = {
@@ -539,11 +600,16 @@ def _segment_routing_force_mask(
                 "reason": "",
                 "boundary_disp_norm": dnorm,
                 "speed_norm": vnorm,
+                "has_left": int(has_left),
+                "has_right": int(has_right),
+                "L": int(L),
             }
 
-    # safety: force mask should only apply inside low frames
-    force = force & low
-    return force, decisions
+    # safety: only apply inside low frames, and make them disjoint
+    force_abst = force_abst & low
+    force_safe_bridge = force_safe_bridge & low
+    force_safe_bridge = force_safe_bridge & (~force_abst)
+    return force_abst, force_safe_bridge, decisions
 
 
 # ============================================================
@@ -1163,6 +1229,11 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         use_speed=bool(sr_raw.get("use_speed", False)),
         speed_norm_q=float(sr_raw.get("speed_norm_q", 0.97)),
         speed_norm=sr_raw.get("speed_norm", None),
+
+        # NEW
+        safe_bridge_max_len=int(sr_raw.get("safe_bridge_max_len", 8)),
+        disp_relax_max=sr_raw.get("disp_relax_max", 0.40),
+        bridge_mode_relaxed=str(sr_raw.get("bridge_mode_relaxed", "linear_safe")).lower(),
     )
     seg_route_fit = _SegRoutingFit()
 
@@ -1469,10 +1540,12 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         # but applied AFTER base AoB as a safety override.
         low_by_tau = (wtil < float(tau))
         force_abst_mask = np.zeros_like(low_by_tau, dtype=bool)
+        force_safe_bridge_mask = np.zeros_like(low_by_tau, dtype=bool)
         seg_route_decisions: Dict[int, Dict[str, Any]] = {}
+
         if seg_route_cfg.enable and (seg_route_fit.disp_norm_thr is not None or seg_route_cfg.require_both_sides):
             try:
-                force_abst_mask, seg_route_decisions = _segment_routing_force_mask(
+                force_abst_mask, force_safe_bridge_mask, seg_route_decisions = _segment_routing_decide_masks(
                     low_by_tau=low_by_tau,
                     z_obs=z_obs,
                     img_hw=arr.get("img_hw", np.array([0, 0], dtype=np.int32)),
@@ -1482,32 +1555,75 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             except Exception as e:
                 print(f"[SegRouting] failed on seq={seq}: {e} -> disabled for this seq")
                 force_abst_mask = np.zeros_like(low_by_tau, dtype=bool)
+                force_safe_bridge_mask = np.zeros_like(low_by_tau, dtype=bool)
                 seg_route_decisions = {}
+        else:
+            force_safe_bridge_mask = np.zeros_like(low_by_tau, dtype=bool)
 
         # --- Base AoB run (original behavior)
         z_fin, is_bridge, is_abst = aob_fill(z_base=z_obs, w=wtil, tau=tau, params=aobp, debug=seg_debug)
 
-        # --- Safety override: for flagged segments, replace with HOLD-only output
-        if seg_route_cfg.enable and bool(np.any(force_abst_mask)):
+        # --- Safety override: apply TWO overrides:
+        #   (1) force_safe_bridge_mask -> linear-safe bridge
+        #   (2) force_abst_mask        -> safe-hold (explicit, not relying on AoB abstain)
+        if seg_route_cfg.enable and (bool(np.any(force_safe_bridge_mask)) or bool(np.any(force_abst_mask))):
             try:
-                aobp_hold = AoBParams(
-                    eps_gate=1.01,  # never bridge
-                    abstain_mode="hold",
-                    eta_L=aobp.eta_L,
-                    eta_u=aobp.eta_u,
-                    max_bridge_len=0,
-                    bridge_mode=aobp.bridge_mode,
-                    hermite_scan=aobp.hermite_scan,
-                    clamp_hermite=aobp.clamp_hermite,
-                    clamp_margin_px=aobp.clamp_margin_px,
-                )
-                z_hold, _, is_abst_hold = aob_fill(z_base=z_obs, w=wtil, tau=tau, params=aobp_hold, debug=None)
-                z_fin[force_abst_mask] = z_hold[force_abst_mask]
-                is_bridge[force_abst_mask] = False
-                is_abst[force_abst_mask] = True
-                _ = is_abst_hold
+                Tseq = int(wtil.size)
+                low = low_by_tau  # segments are defined on low_by_tau
+                segs = _segments_from_mask(low)
+
+                def _linear_safe_bridge_segment(t0: int, t1: int, left: int, right: int) -> None:
+                    # interpolate between z_obs[left] and z_obs[right] but only fill t0..t1
+                    if left < 0 or right >= Tseq or right <= left:
+                        return
+                    zL = z_obs[left].astype(np.float32)
+                    zR = z_obs[right].astype(np.float32)
+                    denom = float(right - left)
+                    if denom <= 0:
+                        return
+                    for t in range(t0, t1 + 1):
+                        a = float(t - left) / denom
+                        a = float(np.clip(a, 0.0, 1.0))
+                        z_fin[t] = (1.0 - a) * zL + a * zR
+
+                def _safe_hold_segment(t0: int, t1: int, left: int, right: int, has_left: bool, has_right: bool) -> None:
+                    # safest: hold boundary observation if exists; else hold local obs
+                    if has_left and left >= 0:
+                        anchor = z_obs[left].astype(np.float32)
+                    elif has_right and right < Tseq:
+                        anchor = z_obs[right].astype(np.float32)
+                    else:
+                        anchor = z_obs[t0].astype(np.float32)
+                    z_fin[t0:t1 + 1] = anchor[None, :]
+
+                for seg_id, (t0, t1) in enumerate(segs):
+                    left = t0 - 1
+                    right = t1 + 1
+                    has_left = (left >= 0) and (not bool(low[left]))
+                    has_right = (right < Tseq) and (not bool(low[right]))
+
+                    # frame-level masks decide whether this segment needs override
+                    seg_force_safe = bool(np.any(force_safe_bridge_mask[t0:t1 + 1]))
+                    seg_force_abst = bool(np.any(force_abst_mask[t0:t1 + 1]))
+
+                    # priority: abstain beats safe-bridge if overlap (shouldn't after disjointing, but be defensive)
+                    if seg_force_abst:
+                        _safe_hold_segment(t0, t1, left, right, has_left, has_right)
+                        is_bridge[t0:t1 + 1] = False
+                        is_abst[t0:t1 + 1] = True
+                    elif seg_force_safe:
+                        if has_left and has_right:
+                            _linear_safe_bridge_segment(t0, t1, left, right)
+                            is_bridge[t0:t1 + 1] = True
+                            is_abst[t0:t1 + 1] = False
+                        else:
+                            # fallback: if boundaries missing, do safe-hold
+                            _safe_hold_segment(t0, t1, left, right, has_left, has_right)
+                            is_bridge[t0:t1 + 1] = False
+                            is_abst[t0:t1 + 1] = True
+
             except Exception as e:
-                print(f"[SegRouting] hold-override failed on seq={seq}: {e} -> keep base AoB output")
+                print(f"[SegRouting] override failed on seq={seq}: {e} -> keep base AoB output")
 
         # --- NEW: segment-level audit table (one row per low segment)
         low_by_aob = (is_bridge | is_abst)
