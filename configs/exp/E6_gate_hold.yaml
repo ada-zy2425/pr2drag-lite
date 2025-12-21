@@ -23,7 +23,7 @@ stage2:
   feat_mode: "b"
 
 stage3:
-  out_dir: "davis2016_E1_no_hmm"
+  out_dir: "davis2016_E6_gate_hold"
 
   tau_mode: "risk"
   tau_risk: 0.005
@@ -44,7 +44,10 @@ stage3:
     eps: 1e-6
 
   hmm:
-    enable: false   
+    prior_good: 0.85
+    p_stay_good: 0.92
+    p_stay_bad: 0.92
+    eps: 1e-3
 
   emission:
     calibration:
@@ -55,15 +58,8 @@ stage3:
     enable: false
 
   aob:
-    abstain_mode: "linear"
-    max_bridge_len: 999
-    eps_gate: 0.0
-    eta_L: 0.0
-    eta_u: 0.0
-    bridge_mode: "hermite"
-    hermite_scan: 6
-    clamp_hermite: true
-    clamp_margin_px: 0.0
+    eps_gate: 1.0           # 强制 gate 永远不通过 => 不 bridge
+    abstain_mode: "hold"
 
   metrics:
     fail_px: 50.0
@@ -72,6 +68,7 @@ stage3:
     write_csv: true
     write_figs: true
     log_to_file: true
+    dump_npz: true
     dump_npz_dir: "_analysis/npz"
     archive:
       enable: true
@@ -79,14 +76,7 @@ stage3:
       zip: true
       copy_out_dir: false
 
-  segment_routing:
-    enable: true
-    mode: "train_quantile"
-    disp_norm_q: 0.95
-    Lmax: 10
-    require_both_sides: true
-    use_speed: true
-    speed_norm_q: 0.97
-    L_short: 2
-    bridge_mode_relaxed: "hermite_safe"
 
+  segment_routing:
+    enable: false   
+    require_both_sides: true

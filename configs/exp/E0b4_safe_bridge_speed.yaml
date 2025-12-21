@@ -89,7 +89,7 @@ stage3:
     mode: "train_quantile"
     disp_norm_q: 0.95
     Lmax: 10
-    require_both_sides: false
+    require_both_sides: true
     use_speed: true
     speed_norm_q: 0.97
     L_short: 2
