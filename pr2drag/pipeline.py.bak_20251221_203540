@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import warnings
 import sys
 import math
 import json
@@ -313,8 +312,7 @@ class _SegRoutingCfg:
     # if disp_too_large but segment is short and has both boundaries, we can do safe-bridge instead of abstain
     safe_bridge_max_len: int = 8          # L <= this => eligible for safe-bridge
     disp_relax_max: Optional[float] = 0.40  # if not None, require dnorm <= this for safe-bridge
-    # supported: linear_safe | hermite_safe
-    bridge_mode_relaxed: str = "linear_safe"
+    bridge_mode_relaxed: str = "linear_safe"  # currently only linear_safe implemented
     L_short: int = 2   # <=2 的低段默认走 safe-bridge(linear)
 
 @dataclass
@@ -1235,71 +1233,6 @@ def _select_tau_risk_constrained_tieaware(
 
 # ============================================================
 # Stage3
-
-
-def _safe_bridge_linear(*, z_obs: np.ndarray, z_fin: np.ndarray, t0: int, t1: int, left: int, right: int) -> None:
-    """Linear interpolation between z_obs[left] and z_obs[right], fill only t0..t1."""
-    Tseq = int(z_obs.shape[0])
-    if left < 0 or right >= Tseq or right <= left:
-        return
-    zL = z_obs[left].astype(np.float32)
-    zR = z_obs[right].astype(np.float32)
-    denom = float(right - left)
-    if denom <= 0:
-        return
-    for t in range(int(t0), int(t1) + 1):
-        a = float(t - left) / denom
-        a = float(np.clip(a, 0.0, 1.0))
-        z_fin[t] = (1.0 - a) * zL + a * zR
-
-
-def _safe_bridge_hermite(*, z_obs: np.ndarray, z_fin: np.ndarray, t0: int, t1: int, left: int, right: int, clamp: bool = True) -> None:
-    """Safe cubic Hermite between endpoints with conservative tangents; clamps to avoid overshoot."""
-    Tseq = int(z_obs.shape[0])
-    if left < 0 or right >= Tseq or right <= left:
-        return
-    zL = z_obs[left].astype(np.float32)
-    zR = z_obs[right].astype(np.float32)
-
-    # conservative tangents
-    m0 = (zR - zL).astype(np.float32)
-    m1 = (zR - zL).astype(np.float32)
-
-    denom = float(right - left)
-    if denom <= 0:
-        return
-
-    if clamp:
-        lo = np.minimum(zL, zR)
-        hi = np.maximum(zL, zR)
-
-    for t in range(int(t0), int(t1) + 1):
-        s = float(t - left) / denom
-        s = float(np.clip(s, 0.0, 1.0))
-        s2 = s * s
-        s3 = s2 * s
-        h00 = 2.0 * s3 - 3.0 * s2 + 1.0
-        h10 = s3 - 2.0 * s2 + s
-        h01 = -2.0 * s3 + 3.0 * s2
-        h11 = s3 - s2
-        z = h00 * zL + h10 * m0 + h01 * zR + h11 * m1
-        if clamp:
-            z = np.clip(z, lo, hi)
-        z_fin[t] = z.astype(np.float32, copy=False)
-
-
-def _apply_safe_bridge(*, mode: str, z_obs: np.ndarray, z_fin: np.ndarray, t0: int, t1: int, left: int, right: int) -> str:
-    """Apply safe bridge override. Supported: linear_safe | hermite_safe. Returns effective mode."""
-    m = str(mode).lower().strip()
-    if m in ("linear", "linear_safe"):
-        _safe_bridge_linear(z_obs=z_obs, z_fin=z_fin, t0=t0, t1=t1, left=left, right=right)
-        return "linear_safe"
-    if m in ("hermite", "hermite_safe"):
-        _safe_bridge_hermite(z_obs=z_obs, z_fin=z_fin, t0=t0, t1=t1, left=left, right=right, clamp=True)
-        return "hermite_safe"
-    warnings.warn(f"[SegRouting] unknown bridge_mode_relaxed='{mode}', fallback to linear_safe")
-    _safe_bridge_linear(z_obs=z_obs, z_fin=z_fin, t0=t0, t1=t1, left=left, right=right)
-    return "linear_safe"
 # ============================================================
 def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Path, out_dir: Path) -> None:
     out_dir = safe_mkdir(out_dir)
@@ -1369,12 +1302,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     wc_method = str(wc_cfg.get("method", "isotonic")).lower()
     wc_bins = int(wc_cfg.get("bins", 50))
 
-    # --- NEW: w override for ablations ("" | "ones")
-    w_override = str(s3.get("w_override", "")).lower().strip()
-    if w_override not in ("", "none", "ones"):
-        raise ValueError(f"[Stage3] unknown w_override={w_override}, expected ''|'ones'")
-    w_override = "" if w_override in ("", "none") else w_override
-
     # --- NEW: oracle reliability switch (for mechanism validation ONLY)
     oracle_cfg = dict(s3.get("oracle", {}))
     oracle_enable = bool(oracle_cfg.get("enable", False))
@@ -1389,11 +1316,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         if wc_enable:
             print("[Oracle] disabling w_calibration (oracle overrides wtil anyway).")
         wc_enable = False
-
-    # --- NEW: allow disabling HMM smoothing (ablation)
-    hmm_enable = bool(hmm_cfg.get("enable", True))
-    if not hmm_enable:
-        print("[HMM] disabled -> use framewise w=p (no forward-backward).")
 
     hmm = HMMParams(
         prior_good=float(hmm_cfg.get("prior_good", 0.85)),
@@ -1477,15 +1399,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     m = emission_metrics(p_va, y_va)
     print(f"[Emission] AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  risk@50%={m['risk@50%']:.4f}")
 
-
-    def _infer_w_from_p(p: np.ndarray) -> np.ndarray:
-        p = np.asarray(p, dtype=np.float32).reshape(-1)
-        if p.size == 0:
-            return p.astype(np.float32)
-        if hmm_enable:
-            return forward_backward_binary(p, hmm).astype(np.float32)
-        return np.clip(p, 0.0, 1.0).astype(np.float32)
-
     def _seq_post_w_raw(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         arr, _meta = _npz_read_safe(npz_path, context="_seq_post_w_raw")
         X = arr["X"][:, keep].astype(np.float32)
@@ -1493,7 +1406,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             X = _robust_iqr_apply(X, scaler, clip=sc_clip)
         p_raw = clf.predict_proba(X)[:, 1].astype(np.float32)
         p = apply_temperature_scaling(p_raw, T, eps=cal_eps) if cal_enable else p_raw
-        w_raw = _infer_w_from_p(p)
+        w_raw = forward_backward_binary(p, hmm)
         y = arr.get("y", np.zeros((w_raw.shape[0],), dtype=np.uint8)).astype(np.uint8)
         return w_raw.astype(np.float32), p.astype(np.float32), y
 
@@ -1530,14 +1443,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 )
 
     def _w_to_wtil(w_raw: np.ndarray) -> np.ndarray:
-        w = w_raw
         if wc_enable and wcal is not None:
-            w = wcal.transform(w)
-        else:
-            w = np.clip(w, 0.0, 1.0).astype(np.float32)
-        if w_override == "ones":
-            return np.ones_like(w, dtype=np.float32)
-        return w.astype(np.float32, copy=False)
+            return wcal.transform(w_raw)
+        return np.clip(w_raw, 0.0, 1.0).astype(np.float32)
 
     tau_global: float = 0.5
 
@@ -1624,11 +1532,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
     all_err_obs_val = []
     all_y_val = []
 
-    # --- Audit (stricter + more defensible)
-    # leak_high: (is_bridge|is_abst) but wtil>=tau  => definition inconsistency (should be 0 ideally)
-    # uncovered_low: (wtil<tau) but NOT(is_bridge|is_abst) => can be valid but must be reported
-    leak_high_total = 0
-    uncovered_low_total = 0
+    # mismatch audit: (wtil < tau) vs (is_bridge|is_abst) should match
+    mismatch_total = 0
+    mismatch_frames_total = 0
 
     pbar = tqdm(sorted(Path(stage2_val).glob("*.npz")), desc="Stage3(val)")
     for npz_path in pbar:
@@ -1646,7 +1552,7 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         p_raw = clf.predict_proba(X)[:, 1].astype(np.float32)
         p = apply_temperature_scaling(p_raw, T, eps=cal_eps) if cal_enable else p_raw
 
-        w_raw = _infer_w_from_p(p).astype(np.float32)
+        w_raw = forward_backward_binary(p, hmm).astype(np.float32)
         wtil = _w_to_wtil(w_raw)
 
         if tau_mode in ("oracle", "global", "risk"):
@@ -1712,6 +1618,26 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                 low = low_by_tau  # segments are defined on low_by_tau
                 segs = _segments_from_mask(low)
 
+                def _safe_bridge_segment(t0: int, t1: int, left: int, right: int, mode: str) -> None:
+                    # interpolate between z_obs[left] and z_obs[right] but only fill t0..t1
+                    if left < 0 or right >= Tseq or right <= left:
+                        return
+                    zL = z_obs[left].astype(np.float32)
+                    zR = z_obs[right].astype(np.float32)
+                    denom = float(right - left)
+                    if denom <= 0:
+                        return
+
+                    m = str(mode).lower()
+                    for t in range(t0, t1 + 1):
+                        a = float(t - left) / denom
+                        a = float(np.clip(a, 0.0, 1.0))
+                        if m == "hermite_safe":
+                            # smoothstep: 3a^2 - 2a^3
+                            a = a * a * (3.0 - 2.0 * a)
+                        # default linear_safe
+                        z_fin[t] = (1.0 - a) * zL + a * zR
+
                 def _safe_hold_segment(t0: int, t1: int, left: int, right: int, has_left: bool, has_right: bool) -> None:
                     # safest: hold boundary observation if exists; else hold local obs
                     if has_left and left >= 0:
@@ -1739,28 +1665,16 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
                         is_abst[t0:t1 + 1] = True
                     elif seg_force_safe:
                         if has_left and has_right:
-                            req = str(getattr(seg_route_cfg, "bridge_mode_relaxed", "linear_safe")).lower()
-                            eff = _apply_safe_bridge(
-                                mode=req,
-                                z_obs=z_obs,
-                                z_fin=z_fin,
-                                t0=t0, t1=t1,
-                                left=left, right=right,
+                            _safe_bridge_segment(
+                                t0, t1, left, right,
+                                mode=str(getattr(seg_route_cfg, "bridge_mode_relaxed", "linear_safe")).lower()
                             )
                             is_bridge[t0:t1 + 1] = True
                             is_abst[t0:t1 + 1] = False
-
-                            # 可审计：记录“请求模式/最终生效模式”
-                            if int(seg_id) in seg_route_decisions:
-                                seg_route_decisions[int(seg_id)]["bridge_mode_req"] = req
-                                seg_route_decisions[int(seg_id)]["bridge_mode_eff"] = eff
                         else:
                             _safe_hold_segment(t0, t1, left, right, has_left, has_right)
                             is_bridge[t0:t1 + 1] = False
                             is_abst[t0:t1 + 1] = True
-                            if int(seg_id) in seg_route_decisions:
-                                seg_route_decisions[int(seg_id)]["bridge_mode_req"] = str(getattr(seg_route_cfg, "bridge_mode_relaxed", "linear_safe")).lower()
-                                seg_route_decisions[int(seg_id)]["bridge_mode_eff"] = "hold_fallback_missing_boundary"
 
             except Exception as e:
                 print(f"[SegRouting] override failed on seq={seq}: {e} -> keep base AoB output")
@@ -1770,10 +1684,9 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         if low_by_tau.shape != low_by_aob.shape:
             raise ValueError(f"[Audit] mask shape mismatch for seq={seq}: {low_by_tau.shape} vs {low_by_aob.shape}")
 
-        leak_high = int(np.sum(low_by_aob & (~low_by_tau)))
-        uncovered_low = int(np.sum(low_by_tau & (~low_by_aob)))
-        leak_high_total += leak_high
-        uncovered_low_total += uncovered_low
+        if not np.array_equal(low_by_tau, low_by_aob):
+            mismatch_total += 1
+            mismatch_frames_total += int(np.sum(low_by_tau != low_by_aob))
 
         segs = _segments_from_mask(low_by_tau)
         if len(segs) > 0:
@@ -1955,13 +1868,15 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
             except Exception as e:
                 print(f"[Warn] failed to write segments_summary_v1.csv: {e}")
 
+    if mismatch_total > 0:
+        print(f"[Audit] mismatch in {mismatch_total} seqs; mismatch_frames_total={mismatch_frames_total}")
     try:
-        write_json(analysis_dir / "audit_mask_mismatch_v2.json", {
-            "leak_high_total": int(leak_high_total),
-            "uncovered_low_total": int(uncovered_low_total),
+        write_json(analysis_dir / "audit_mask_mismatch_v1.json", {
+            "mismatch_seqs": int(mismatch_total),
+            "mismatch_frames_total": int(mismatch_frames_total),
         })
     except Exception as e:
-        print(f"[Warn] failed to write audit_mask_mismatch_v2.json: {e}")
+        print(f"[Warn] failed to write audit_mask_mismatch_v1.json: {e}")
 
     try:
         from scipy.stats import spearmanr  # type: ignore
@@ -1976,10 +1891,6 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
 
     (analysis_dir / "corr_wtil_err.txt").write_text(f"spearman(wtil, -err_obs) = {rho}\n", encoding="utf-8")
     print(f"[OK] wrote stage3 to: {out_dir}")
-
-    if leak_high_total > 0:
-        print(f"[Audit][WARN] leak_high_total={leak_high_total} (should be 0 ideally).")
-    print(f"[Audit] uncovered_low_total={uncovered_low_total} (report for transparency).")
     print(f"  spearman(wtil, -err_obs) = {rho}")
 
     if bool(ana_cfg.get("write_figs", True)) and len(df) > 0:
