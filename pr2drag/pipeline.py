@@ -1648,17 +1648,38 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         print(f"[Tau] oracle-fixed: tau_global={tau_global:.6f}")
 
     elif tau_mode == "global":
-        ws = []
-        for pth in sorted(Path(stage2_train).glob("*.npz")):
-            w_raw, _, _ = _seq_post_w_raw(pth)
-            ws.append(_w_to_wtil(w_raw))
-        w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
-        if w_all.size == 0:
-            tau_global = 0.5
+        # --- FIX: "global" should respect cfg-provided tau_global as a fixed threshold.
+        # If not provided, keep legacy behavior: learn tau by global quantile on train.
+        tau_cfg = s3.get("tau_global", None)
+
+        if tau_cfg is not None:
+            # fixed global tau from config (baseline-friendly)
+            try:
+                tau_global = float(tau_cfg)
+            except Exception as e:
+                raise ValueError(f"[Tau] cfg tau_global is not a number: {tau_cfg} ({e})")
+
+            # allow tau=0.0 even if tau_min default is 1e-6 (tau_min is mainly for learned taus)
+            lower = 0.0 if abs(tau_global) < 1e-12 else float(tau_min)
+            tau_global = clamp(tau_global, lower, float(tau_max))
+
+            print(f"[Tau] global-fixed (cfg): tau_global={tau_global:.6f}")
+
         else:
-            tau_global = float(np.quantile(w_all.astype(np.float64), target_frac))
-            tau_global = clamp(tau_global, tau_min, tau_max)
-        print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
+            # legacy: global quantile learned from train
+            ws = []
+            for pth in sorted(Path(stage2_train).glob("*.npz")):
+                w_raw, _, _ = _seq_post_w_raw(pth)
+                ws.append(_w_to_wtil(w_raw))
+            w_all = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float32)
+
+            if w_all.size == 0:
+                tau_global = 0.5
+            else:
+                tau_global = float(np.quantile(w_all.astype(np.float64), target_frac))
+                tau_global = clamp(tau_global, float(tau_min), float(tau_max))
+
+            print(f"[Tau] global_quantile from train: tau_global={tau_global:.6f} (target_frac={target_frac})")
 
     elif tau_mode == "risk":
         ws, ys = [], []
@@ -2101,7 +2122,10 @@ def stage3_train_eval(cfg: Dict[str, Any], *, stage2_train: Path, stage2_val: Pa
         wcat = np.concatenate(all_wtil_val, axis=0) if all_wtil_val else np.zeros((0,), dtype=np.float32)
         ecat = np.concatenate(all_err_obs_val, axis=0) if all_err_obs_val else np.zeros((0,), dtype=np.float32)
         if wcat.size > 10 and ecat.size == wcat.size:
-            rho = float(spearmanr(wcat, -ecat).correlation)
+            if np.allclose(wcat, wcat[0]) or np.allclose(ecat, ecat[0]):
+                rho = float("nan")
+            else:
+                rho = float(spearmanr(wcat, -ecat).correlation)
         else:
             rho = float("nan")
     except Exception:
