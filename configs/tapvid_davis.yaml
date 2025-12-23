@@ -5,7 +5,7 @@ base_out: "/content/drive/MyDrive/pr2drag_data"
 
 tapvid:
   split: "davis"
-  pkl_path: "/content/drive/MyDrive/tapvid/tapvid_davis/tapvid_davis.pkl"
+  pkl_path: "/content/pr2drag-lite/tapvid_davis/tapvid_davis.pkl"
 
   # queries
   query_mode: "tapvid"   # enum: [tapvid, strided]
@@ -13,7 +13,7 @@ tapvid:
   max_queries: 0         # 0=不限制；>0 则下采样到固定数量（可复现）
 
   # tracker / preds
-  tracker: "none"
+  tracker: "oracle"
   tracker_ckpt: ""       # 可空；为空则用 tracker 默认
   pred_dir: ""           # 若为空 -> 默认: {base_out}/tapvid_preds/{tracker}_{query_mode}
   overwrite_preds: false # pred 已存在是否重算

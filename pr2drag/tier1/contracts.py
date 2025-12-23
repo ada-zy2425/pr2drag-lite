@@ -117,8 +117,17 @@ class RootConfig:
             if max_queries < 0:
                 raise ValueError("[contracts] tapvid.max_queries must be >=0")
 
-            tracker = _require_enum("tapvid.tracker", _as_str(t.get("tracker", "none")).strip(),
-                                    {"tapir", "cotracker_v2", "none"})
+            tracker_raw = _as_str(t.get("tracker", "none")).strip().lower()
+
+            # 可选：alias
+            if tracker_raw in ("gt", "ground_truth"):
+                tracker_raw = "oracle"
+
+            tracker = _require_enum(
+                "tapvid.tracker",
+                tracker_raw,
+                allowed={"tapir", "cotracker_v2", "none", "oracle"},
+            )
             tracker_ckpt = _as_str(t.get("tracker_ckpt", "")).strip()
             pred_dir = _as_str(t.get("pred_dir", "")).strip()
             overwrite_preds = bool(t.get("overwrite_preds", False))

@@ -346,7 +346,7 @@ def _dispatch(cmd: str, cfg_path_str: str, cfg: Dict[str, Any], paths: Dict[str,
             raise ValueError(f"cmd=tapvid_pred requires dataset=tapvid (got {ds}).")
         from pr2drag.tapvid_pred import tapvid_pred_from_config
 
-        tapvid_pred_from_config(cfg_path_str, tracker="oracle", overwrite=overwrite)
+        tapvid_pred_from_config(cfg_path_str, tracker=None, overwrite=overwrite)
         return
 
     if cmd == "tapvid_eval":
