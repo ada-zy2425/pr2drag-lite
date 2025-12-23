@@ -18,28 +18,51 @@ from .utils import pretty_header, read_yaml, resolve_davis_root, set_seed
 # Dataset-aware cfg utilities
 # ---------------------------
 def _dataset_name(cfg: Dict[str, Any]) -> str:
+    """
+    Support both:
+      - dataset: tapvid          (string)
+      - dataset: {name: tapvid}  (dict)
+    """
     ds = cfg.get("dataset", None)
+
+    if isinstance(ds, str):
+        name = ds.strip().lower()
+        return name if name else "davis"
+
     if isinstance(ds, dict):
         name = str(ds.get("name", "")).strip().lower()
         return name if name else "davis"
+
     # legacy configs have no dataset section => davis
     return "davis"
-
 
 def _normalize_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Backward compatible:
       - legacy: no cfg.dataset => assume davis
-      - new: require cfg.dataset.name
+      - new: cfg.dataset can be string or dict
+    Normalize to dict form: cfg["dataset"] = {"name": "..."}.
     """
-    if "dataset" not in cfg or not isinstance(cfg.get("dataset", {}), dict):
-        cfg = dict(cfg)
+    cfg = dict(cfg)
+
+    if "dataset" not in cfg:
         cfg["dataset"] = {"name": "davis"}
-    else:
-        cfg = dict(cfg)
-        cfg["dataset"] = dict(cfg["dataset"])
-        cfg["dataset"].setdefault("name", "davis")
-    return cfg
+        return cfg
+
+    ds = cfg["dataset"]
+    if isinstance(ds, str):
+        cfg["dataset"] = {"name": ds.strip().lower() or "davis"}
+        return cfg
+
+    if isinstance(ds, dict):
+        dd = dict(ds)
+        dd.setdefault("name", "davis")
+        dd["name"] = str(dd["name"]).strip().lower() or "davis"
+        cfg["dataset"] = dd
+        return cfg
+
+    raise TypeError(f"cfg.dataset must be str or dict, got {type(ds)}")
+
 
 
 def _validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -47,6 +70,7 @@ def _validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("seed", 0)
 
     ds = _dataset_name(cfg)
+
     if ds == "davis":
         need = ["davis_root", "res", "base_out", "splits"]
         for k in need:
@@ -61,12 +85,24 @@ def _validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         return cfg
 
     if ds == "tapvid":
-        # strict but minimal; deeper checks live in tapvid runners
+        # Strict but relevant checks for tapvid
         if "base_out" not in cfg:
             raise KeyError("Missing config key: base_out (dataset=tapvid)")
+        if "davis_root" not in cfg:
+            raise KeyError("Missing config key: davis_root (dataset=tapvid)")
+
+        cfg["davis_root"] = str(resolve_davis_root(cfg["davis_root"]))
+
         cfg.setdefault("tapvid", {})
         if not isinstance(cfg["tapvid"], dict):
             raise TypeError("cfg.tapvid must be a dict (dataset=tapvid)")
+
+        # optional deeper key checks (runner will still validate)
+        if "pkl_path" not in cfg["tapvid"]:
+            raise KeyError("Missing config key: tapvid.pkl_path (dataset=tapvid)")
+        if "split" not in cfg["tapvid"]:
+            cfg["tapvid"]["split"] = "davis"
+
         return cfg
 
     raise ValueError(f"Unknown dataset name: {ds}. Expected 'davis' or 'tapvid'.")
