@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Callable
 
 from .archive import (
     ArchiveOptions,
@@ -11,7 +11,6 @@ from .archive import (
     parse_archive_options,
     tee_stdout_stderr,
 )
-from .pipeline import stage1_precompute_split, stage2_compute_split, stage3_train_eval
 from .utils import pretty_header, read_yaml, resolve_davis_root, set_seed
 
 
@@ -62,10 +61,9 @@ def _validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         return cfg
 
     if ds == "tapvid":
-        # We keep it strict but minimal here; tier0 runner will do deeper checks.
+        # strict but minimal; deeper checks live in tapvid runners
         if "base_out" not in cfg:
             raise KeyError("Missing config key: base_out (dataset=tapvid)")
-        # optional: cfg.tapvid.out_dir
         cfg.setdefault("tapvid", {})
         if not isinstance(cfg["tapvid"], dict):
             raise TypeError("cfg.tapvid must be a dict (dataset=tapvid)")
@@ -102,21 +100,55 @@ def _compute_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
         out_dir = base_out / cfg.get("tapvid", {}).get("out_dir", "tapvid_tier0")
         return {"base_out": base_out, "out_dir_tapvid": out_dir}
 
-    # should never hit
     raise ValueError(f"Unknown dataset: {ds}")
 
 
-def _run_all_explicit(cfg: Dict[str, Any]) -> None:
+# ---------------------------
+# Lazy pipeline resolver (robust to renames)
+# ---------------------------
+def _resolve_davis_pipeline_fns() -> Tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
     """
-    Legacy DAVIS run_all (exactly as before).
-    For other datasets, run their dedicated command.
+    Import pr2drag.pipeline lazily and resolve function names robustly.
+    This avoids tapvid_* commands being blocked by pipeline import/name issues.
+    """
+    try:
+        import pr2drag.pipeline as pipeline  # lazy import
+    except Exception as e:
+        raise ImportError(
+            "[cli] Failed to import pr2drag.pipeline. "
+            "This does NOT affect tapvid_* commands, but DAVIS commands need pipeline to import."
+        ) from e
+
+    def pick(candidates: Tuple[str, ...]) -> Callable[..., Any]:
+        for name in candidates:
+            if hasattr(pipeline, name):
+                fn = getattr(pipeline, name)
+                if callable(fn):
+                    return fn
+        avail = [k for k in dir(pipeline) if k.startswith("stage") or k.startswith("run_")]
+        raise AttributeError(
+            "[cli] Cannot find expected DAVIS pipeline entrypoints in pr2drag.pipeline.\n"
+            f"  Tried: {candidates}\n"
+            f"  Available (filtered): {avail}\n"
+            "Fix: either export these functions in pipeline.py or update cli.py resolver."
+        )
+
+    stage1 = pick(("stage1_precompute_split", "stage1_precompute", "stage1"))
+    stage2 = pick(("stage2_compute_split", "stage2_compute", "stage2"))
+    stage3 = pick(("stage3_train_eval", "stage3_eval", "stage3"))
+    return stage1, stage2, stage3
+
+
+def _run_all_explicit(cfg: Dict[str, Any], paths: Dict[str, Path]) -> None:
+    """
+    Legacy DAVIS run_all (exactly as before), but with lazy pipeline import.
     """
     ds = _dataset_name(cfg)
     if ds != "davis":
-        raise ValueError(f"cmd=run_all only supports dataset=davis (got {ds}). Use cmd=run_tapvid_tier0 etc.")
+        raise ValueError(f"cmd=run_all only supports dataset=davis (got {ds}). Use tapvid_pred/tapvid_eval etc.")
 
-    paths = _compute_paths(cfg)
-    base_out = paths["base_out"]
+    stage1_precompute_split, stage2_compute_split, stage3_train_eval = _resolve_davis_pipeline_fns()
+
     out_train_s1 = paths["out_train_s1"]
     out_val_s1 = paths["out_val_s1"]
     out_train_s2 = paths["out_train_s2"]
@@ -148,7 +180,15 @@ def main() -> None:
         "--cmd",
         type=str,
         default="run_all",
-        choices=["run_all", "stage1", "stage2", "stage3", "run_tapvid_tier0"],
+        choices=[
+            "run_all",
+            "stage1",
+            "stage2",
+            "stage3",
+            "tapvid_pred",
+            "tapvid_eval",
+            "run_tapvid_tier0",
+        ],
     )
     ap.add_argument(
         "--tag",
@@ -160,6 +200,11 @@ def main() -> None:
         "--no_archive",
         action="store_true",
         help="Disable archiving even if enabled in config.",
+    )
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="For tapvid_pred: overwrite existing prediction npz files",
     )
     args = ap.parse_args()
 
@@ -178,13 +223,18 @@ def main() -> None:
     else:
         out_dir_for_tag = paths["out_dir_tapvid"]
 
-    print(pretty_header("PR2-Drag Lite", {
-        "cmd": args.cmd,
-        "dataset": ds,
-        "config": args.config,
-        "base_out": str(cfg["base_out"]),
-        **({"davis_root": cfg["davis_root"], "res": cfg["res"]} if ds == "davis" else {}),
-    }))
+    print(
+        pretty_header(
+            "PR2-Drag Lite",
+            {
+                "cmd": args.cmd,
+                "dataset": ds,
+                "config": args.config,
+                "base_out": str(cfg["base_out"]),
+                **({"davis_root": cfg["davis_root"], "res": cfg["res"]} if ds == "davis" else {}),
+            },
+        )
+    )
 
     # archive options
     opts: ArchiveOptions = parse_archive_options(cfg)
@@ -195,27 +245,22 @@ def main() -> None:
     tag = args.tag if args.tag else out_dir_for_tag.name
 
     # log path (auto)
-    # keep your legacy behavior: stage3 analysis/logging
     if ds == "davis":
         s3_ana = dict(cfg.get("stage3", {}).get("analysis", {}))
         log_to_file = bool(s3_ana.get("log_to_file", False)) or opts.enable
         log_path = paths["out_dir_s3"] / "_analysis" / "run.log"
     else:
-        # tapvid tier0 also logs under its out_dir/_analysis
         t_ana = dict(cfg.get("tapvid", {}).get("analysis", {}))
         log_to_file = bool(t_ana.get("log_to_file", False)) or opts.enable
         log_path = paths["out_dir_tapvid"] / "_analysis" / "run.log"
 
     def _maybe_archive(cmd_name: str) -> None:
-        # Only archive for commands that produce final outputs
-        if cmd_name not in ("stage3", "run_all", "run_tapvid_tier0"):
+        if cmd_name not in ("stage3", "run_all", "run_tapvid_tier0", "tapvid_eval", "tapvid_pred"):
             return
         if not opts.enable:
             return
 
-        # archive_run expects out_dir; use dataset output dir
         out_dir = paths["out_dir_s3"] if ds == "davis" else paths["out_dir_tapvid"]
-
         z = archive_run(
             base_out=base_out,
             out_dir=out_dir,
@@ -231,14 +276,13 @@ def main() -> None:
     try:
         if log_to_file:
             with tee_stdout_stderr(log_path):
-                _dispatch(args.cmd, cfg, paths)
+                _dispatch(args.cmd, args.config, cfg, paths, overwrite=bool(args.overwrite))
         else:
-            _dispatch(args.cmd, cfg, paths)
+            _dispatch(args.cmd, args.config, cfg, paths, overwrite=bool(args.overwrite))
 
         _maybe_archive(args.cmd)
 
     except Exception as e:
-        # try to archive traceback for post-mortem
         if opts.enable:
             out_dir = paths["out_dir_s3"] if ds == "davis" else paths["out_dir_tapvid"]
             archive_on_exception(
@@ -255,14 +299,38 @@ def main() -> None:
         raise
 
 
-def _dispatch(cmd: str, cfg: Dict[str, Any], paths: Dict[str, Path]) -> None:
+def _dispatch(cmd: str, cfg_path_str: str, cfg: Dict[str, Any], paths: Dict[str, Path], overwrite: bool) -> None:
     ds = _dataset_name(cfg)
 
+    # -------------------------
+    # TAP-Vid commands (independent, no pipeline)
+    # -------------------------
+    if cmd == "tapvid_pred":
+        if ds != "tapvid":
+            raise ValueError(f"cmd=tapvid_pred requires dataset=tapvid (got {ds}).")
+        from pr2drag.tapvid_pred import tapvid_pred_from_config
+
+        tapvid_pred_from_config(cfg_path_str, tracker="oracle", overwrite=overwrite)
+        return
+
+    if cmd == "tapvid_eval":
+        if ds != "tapvid":
+            raise ValueError(f"cmd=tapvid_eval requires dataset=tapvid (got {ds}).")
+        from pr2drag.tapvid_eval import tapvid_eval_from_config
+
+        tapvid_eval_from_config(cfg_path_str)
+        return
+
+    # -------------------------
+    # DAVIS legacy commands
+    # -------------------------
     if cmd == "run_all":
-        _run_all_explicit(cfg)
+        _run_all_explicit(cfg, paths)
         return
 
     if ds == "davis":
+        stage1_precompute_split, stage2_compute_split, stage3_train_eval = _resolve_davis_pipeline_fns()
+
         out_train_s1 = paths["out_train_s1"]
         out_val_s1 = paths["out_val_s1"]
         out_train_s2 = paths["out_train_s2"]
@@ -282,11 +350,6 @@ def _dispatch(cmd: str, cfg: Dict[str, Any], paths: Dict[str, Path]) -> None:
         if cmd == "stage3":
             stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)
             return
-        
-        if cmd == "tapvid_eval":
-            from pr2drag.tapvid_eval import tapvid_eval_from_config
-            tapvid_eval_from_config(args.config)
-            return  
 
         if cmd == "run_tapvid_tier0":
             raise ValueError("cmd=run_tapvid_tier0 requires dataset=tapvid (current config is dataset=davis).")
@@ -295,10 +358,10 @@ def _dispatch(cmd: str, cfg: Dict[str, Any], paths: Dict[str, Path]) -> None:
 
     if ds == "tapvid":
         if cmd != "run_tapvid_tier0":
-            raise ValueError(f"dataset=tapvid only supports cmd=run_tapvid_tier0 (got {cmd}).")
+            raise ValueError(f"dataset=tapvid only supports cmd=tapvid_pred/tapvid_eval/run_tapvid_tier0 (got {cmd}).")
 
-        # Lazy import so current DAVIS baseline never depends on tapvid code.
-        from .pipeline import run_tapvid_tier0  # local import on purpose
+        # keep your previous behavior: lazy import inside
+        from .pipeline import run_tapvid_tier0  # type: ignore
 
         out_dir = paths["out_dir_tapvid"]
         run_tapvid_tier0(cfg, out_dir=out_dir)
