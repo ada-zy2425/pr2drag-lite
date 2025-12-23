@@ -9,9 +9,8 @@ from typing import Any, Dict
 
 import numpy as np
 
-from pr2drag.tapvid import build_tapvid_dataset
 from pr2drag.tier1.contracts import RootConfig
-
+from ..datasets.tapvid import build_tapvid_dataset, load_tapvid_pkl, TapVidSeq
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
