@@ -2234,3 +2234,43 @@ def run_all(cfg: Dict[str, Any]) -> None:
     print(f"[OK] Stage2 done: train_npz= {len(list(out_train_s2.glob('*.npz')))} val_npz= {len(list(out_val_s2.glob('*.npz')))}")
 
     stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)
+
+def run_tapvid_tier0(cfg: Dict[str, Any], *, out_dir: Path) -> None:
+    """
+    TAP-Vid Tier-0 runner entry (dispatcher target).
+
+    This is intentionally a strict stub for now:
+      - It guarantees DAVIS path remains unchanged
+      - It provides a stable CLI/archiving/logging contract
+      - Next commit we will implement:
+          datasets/tapvid.py + trackers/* + tier0/metrics + audit schema
+    """
+    ds = cfg.get("dataset", {})
+    name = str(ds.get("name", "tapvid")).lower()
+    if name != "tapvid":
+        raise ValueError(f"run_tapvid_tier0 called with dataset={name} (expected tapvid).")
+
+    out_dir = safe_mkdir(Path(out_dir))
+    analysis_dir = safe_mkdir(out_dir / "_analysis")
+
+    # minimal manifest now (so archive pack already works)
+    try:
+        manifest = {
+            "time_utc": _now_utc_iso(),
+            "python": sys.version,
+            "platform": platform.platform(),
+            "argv": list(sys.argv),
+            "git_head": _try_git_head(),
+            "out_dir": str(out_dir),
+            "dataset": "tapvid",
+        }
+        write_json(analysis_dir / "run_manifest_v1.json", manifest)
+        write_json(analysis_dir / "config_resolved_v1.json", cfg)
+    except Exception as e:
+        print(f"[Warn] failed to write tapvid manifest/config: {e}")
+
+    raise NotImplementedError(
+        "TAP-Vid Tier-0 runner is wired in CLI, but not implemented yet.\n"
+        "Next commit will add: datasets/tapvid.py, trackers/, tier0/metrics_tapvid.py, tier0/audit_schema.py.\n"
+        "This stub is here to lock the interface & archiving contract."
+    )
