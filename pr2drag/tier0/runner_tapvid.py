@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import inspect
 
 import numpy as np
 
@@ -57,6 +58,63 @@ def _tyx_to_txy(q_tyx: np.ndarray) -> np.ndarray:
     out[:, 2] = q[:, 1]  # y
     return out
 
+
+def _call_run_cotracker_v2(
+    run_fn,
+    *,
+    video_uint8: np.ndarray,
+    queries_tyx: np.ndarray,
+    checkpoint: str | None,
+    device: str | None,
+):
+    """
+    Robustly call run_cotracker_v2 across different API variants.
+
+    We have queries in TAP-Vid format: [Q,3] (t,y,x).
+    Some implementations expect:
+      - queries_tyx
+      - queries_txy  (t,x,y)
+      - query_points / queries
+    """
+    sig = inspect.signature(run_fn)
+    params = set(sig.parameters.keys())
+
+    q_tyx = np.asarray(queries_tyx, dtype=np.float32)
+    _require(q_tyx.ndim == 2 and q_tyx.shape[1] == 3, f"[tapvid] queries_tyx must be [Q,3], got {q_tyx.shape}")
+
+    # convert tyx -> txy if needed
+    q_txy = q_tyx.copy()
+    q_txy[:, 1] = q_tyx[:, 2]  # x
+    q_txy[:, 2] = q_tyx[:, 1]  # y
+
+    kwargs = {
+        "video_uint8": video_uint8,
+        "checkpoint": checkpoint,
+        "device": device,
+    }
+
+    if "queries_tyx" in params:
+        kwargs["queries_tyx"] = q_tyx
+    elif "queries_txy" in params:
+        kwargs["queries_txy"] = q_txy
+    elif "query_points" in params:
+        # ambiguous: assume t,y,x is more common for "points"
+        kwargs["query_points"] = q_tyx
+    elif "queries" in params:
+        kwargs["queries"] = q_tyx
+    else:
+        raise TypeError(
+            "[tapvid_pred] run_cotracker_v2 signature does not accept any known query argument name. "
+            f"Available params={sorted(params)}. Expected one of: queries_tyx / queries_txy / query_points / queries"
+        )
+
+    # drop None keys if backend doesn't accept them
+    if "checkpoint" in params and kwargs.get("checkpoint") is None:
+        kwargs.pop("checkpoint")
+    if "device" in params and kwargs.get("device") is None:
+        kwargs.pop("device")
+
+    return run_fn(**kwargs)
 
 # ---------------------------
 # video IO + resize to 256 (optional)
@@ -368,10 +426,12 @@ def run_tapvid_pred(cfg: RootConfig, config_path: str, config_sha1: str) -> Dict
                 if bool(tcfg.resize_to_256):
                     video = _resize_video_to_256(video, keep_aspect=bool(tcfg.keep_aspect), interp=str(tcfg.interp))
 
-                from pr2drag.trackers.cotracker_v2 import run_cotracker_v2  # local import
-                out = run_cotracker_v2(
+                from pr2drag.trackers.cotracker_v2 import run_cotracker_v2
+
+                out = _call_run_cotracker_v2(
+                    run_cotracker_v2,
                     video_uint8=video,
-                    queries_tyx=q_tyx.astype(np.float32),   # [Q,3] (t,y,x)
+                    queries_tyx=q_tyx,
                     checkpoint=(tcfg.tracker_ckpt or None),
                     device=None,
                 )
