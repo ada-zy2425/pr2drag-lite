@@ -7,7 +7,7 @@ from typing import Any, Dict
 import numpy as np
 
 from pr2drag.tier1.contracts import RootConfig
-from pr2drag.datasets.tapvid import build_tapvid_dataset
+from pr2drag.tier0.runner_tapvid import run_tapvid_pred
 
 
 def _safe_mkdir(p: str | Path) -> Path:
@@ -30,38 +30,9 @@ def _write_pred_npz(path: Path, tracks_xy: np.ndarray, vis: np.ndarray, queries_
     np.savez_compressed(str(path), tracks_xy=tracks_xy.astype(np.float32), vis=vis.astype(bool), queries_txy=queries_txy.astype(np.float32))
 
 
-def tapvid_pred_from_config(cfg_path: str, tracker: str = "oracle", overwrite: bool = False) -> Dict[str, Any]:
+
+def tapvid_pred_from_config(cfg_path: str) -> Dict[str, Any]:
     cfg = RootConfig.from_yaml(cfg_path)
     if cfg.dataset != "tapvid" or cfg.tapvid is None:
         raise ValueError(f"[tapvid_pred] config dataset must be 'tapvid'. got: {cfg.dataset}")
-    if cfg.davis_root is None:
-        raise KeyError("[tapvid_pred] missing davis_root in config")
-
-    res = cfg.res or "480p"
-    tcfg = cfg.tapvid
-    pred_dir = _safe_mkdir(tcfg.pred_dir)
-
-    seqs = build_tapvid_dataset(
-        davis_root=cfg.davis_root,
-        pkl_path=tcfg.pkl_path,
-        split=tcfg.split,
-        res=res,
-        query_mode=tcfg.query_mode,
-        stride=tcfg.stride,
-    )
-
-    if tracker != "oracle":
-        raise NotImplementedError("[tapvid_pred] currently only supports tracker='oracle' (sanity baseline).")
-
-    wrote = 0
-    skipped = 0
-    for seq in seqs:
-        out = pred_dir / f"{seq.name}.npz"
-        if out.exists() and not overwrite:
-            skipped += 1
-            continue
-        # ORACLE: pred == GT
-        _write_pred_npz(out, tracks_xy=seq.gt_tracks_xy, vis=seq.gt_vis, queries_txy=seq.queries_txy)
-        wrote += 1
-
-    return {"pred_dir": str(pred_dir), "wrote": wrote, "skipped": skipped, "num_seqs": len(seqs)}
+    return run_tapvid_pred(cfg, config_path=cfg.config_path, config_sha1=cfg.config_sha1)

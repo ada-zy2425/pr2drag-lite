@@ -1,22 +1,24 @@
 # pr2drag/datasets/tapvid.py
 from __future__ import annotations
 
+import os
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
-import pickle
 
 
 @dataclass(frozen=True)
 class TapVidSeq:
     name: str
-    frame_paths: List[str]                 # len=T; 允许为空（pkl 内带 video 时可为空）
-    video_hw: Tuple[int, int]              # (H, W)
-    gt_tracks_xy: np.ndarray               # float32 [Q, T, 2] in (x,y)
-    gt_vis: np.ndarray                     # bool   [Q, T]
-    queries_txy: np.ndarray                # float32/int [Q, 3] (t0, x0, y0)
+    frame_paths: List[str]              # len=T (can be empty if not resolvable)
+    video_hw: Tuple[int, int]           # (H, W) original
+    gt_tracks_xy: np.ndarray            # float32 [N,T,2] in (x,y)
+    gt_occluded: np.ndarray             # bool [N,T] True=occluded
+    query_points_tyx: np.ndarray        # float32 [Q,3] (t,y,x)
+    query_track_ids: np.ndarray         # int64   [Q]
 
 
 def load_tapvid_pkl(pkl_path: str) -> Dict[str, Any]:
@@ -25,197 +27,209 @@ def load_tapvid_pkl(pkl_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"[tapvid] pkl not found: {p}")
     with p.open("rb") as f:
         obj = pickle.load(f)
-    if not isinstance(obj, dict) or not obj:
-        raise TypeError(f"[tapvid] pkl root must be non-empty dict, got {type(obj)}")
+    if not isinstance(obj, dict):
+        raise TypeError(f"[tapvid] pkl root must be dict[seq->dict], got {type(obj)}")
     return obj
 
 
-def _infer_hw_from_video(video: np.ndarray) -> Tuple[int, int]:
-    if not isinstance(video, np.ndarray) or video.ndim != 4 or video.shape[-1] != 3:
-        raise ValueError(f"[tapvid] 'video' must be [T,H,W,3], got {getattr(video, 'shape', None)}")
-    return int(video.shape[1]), int(video.shape[2])
+def _resolve_davis_frame_paths(davis_root: str, res: str, seq: str, T: int) -> List[str]:
+    """
+    DAVIS layout: {davis_root}/JPEGImages/{res}/{seq}/00000.jpg ...
+    We try 00000.. or 00001.. both, return empty list if not found.
+    """
+    root = Path(davis_root) / "JPEGImages" / res / seq
+    if not root.exists():
+        return []
+    # try 00000 indexing
+    cand0 = root / "00000.jpg"
+    cand1 = root / "00001.jpg"
+    if cand0.exists():
+        return [str(root / f"{t:05d}.jpg") for t in range(T)]
+    if cand1.exists():
+        return [str(root / f"{t:05d}.jpg") for t in range(1, T + 1)]
+    return []
 
 
-def _ensure_bool(a: np.ndarray) -> np.ndarray:
+def _as_bool(a: np.ndarray) -> np.ndarray:
     if a.dtype == np.bool_:
         return a
     return (a.astype(np.int32) != 0)
 
 
-def _infer_xy_order(points: np.ndarray, hw: Tuple[int, int]) -> str:
+def _pick_query_for_track(points_xy: np.ndarray, occ: np.ndarray) -> Optional[Tuple[int, float, float]]:
     """
-    points[...,2] 可能是 (y,x) 或 (x,y)。用 (H,W) 做一次鲁棒推断。
+    points_xy: [T,2] (x,y)
+    occ: [T] bool True=occluded
+    Strategy: first frame where not occluded and coords finite.
     """
-    H, W = hw
-    p0 = float(np.nanmax(points[..., 0]))
-    p1 = float(np.nanmax(points[..., 1]))
-
-    # 典型：W > H。若维0更像 W，说明维0是 x；反之维1是 x。
-    score0_x = abs(p0 - W) < abs(p0 - H)
-    score1_x = abs(p1 - W) < abs(p1 - H)
-
-    if score0_x and (not score1_x):
-        return "xy"
-    if score1_x and (not score0_x):
-        return "yx"
-
-    # fallback：谁更大谁更像 x（因为 W 通常更大）
-    return "xy" if p0 >= p1 else "yx"
+    T = points_xy.shape[0]
+    for t in range(T):
+        if occ[t]:
+            continue
+        x, y = float(points_xy[t, 0]), float(points_xy[t, 1])
+        if np.isfinite(x) and np.isfinite(y):
+            return (t, y, x)  # (t,y,x)
+    return None
 
 
-def _to_xy(points: np.ndarray, order: str) -> np.ndarray:
-    if order == "xy":
-        return points
-    if order == "yx":
-        return points[..., ::-1]
-    raise ValueError(f"Unknown order={order}")
-
-
-def _first_visible_t(vis_row: np.ndarray) -> int:
-    idx = np.flatnonzero(vis_row)
-    return int(idx[0]) if idx.size > 0 else 0
-
-
-def _make_queries_txy_from_tracks(
-    tracks_xy: np.ndarray,   # [Q,T,2]
-    vis: np.ndarray,         # [Q,T]
-    mode: str,
-    stride: int,
-    max_queries: int,
-    seed: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    返回 (queries_txy, tracks_out, vis_out)
-      - queries_txy: [Q',3] (t,x,y)
-      - tracks_out : [Q',T,2]
-      - vis_out    : [Q',T]
-    """
-    if mode not in ("tapvid", "strided"):
-        raise ValueError(f"[tapvid] query_mode must be one of ['tapvid','strided'], got {mode!r}")
-
-    Q, T, _ = tracks_xy.shape
-    if Q == 0 or T == 0:
-        raise ValueError(f"[tapvid] empty tracks shape={tracks_xy.shape}")
-
-    if mode == "tapvid":
-        q_list: List[List[float]] = []
-        for i in range(Q):
-            t0 = _first_visible_t(vis[i])
-            x0, y0 = tracks_xy[i, t0].tolist()
-            q_list.append([float(t0), float(x0), float(y0)])
-        queries = np.asarray(q_list, dtype=np.float32)
-        return queries, tracks_xy.astype(np.float32), vis.astype(np.bool_)
-
-    # mode == "strided"
-    if stride <= 0:
-        raise ValueError(f"[tapvid] stride must be >0 for strided mode, got {stride}")
-
-    q_list = []
-    tracks_list = []
-    vis_list = []
-
-    for i in range(Q):
-        for t in range(0, T, stride):
-            if not bool(vis[i, t]):
-                continue
-            x, y = tracks_xy[i, t].tolist()
-            q_list.append([float(t), float(x), float(y)])
-            tracks_list.append(tracks_xy[i])
-            vis_list.append(vis[i])
-
-    if not q_list:
-        # 保底：退化成 tapvid，避免“无 query”导致后续崩
-        return _make_queries_txy_from_tracks(tracks_xy, vis, mode="tapvid", stride=stride, max_queries=0, seed=seed)
-
-    queries = np.asarray(q_list, dtype=np.float32)
-    tracks_out = np.stack(tracks_list, axis=0).astype(np.float32)  # [Q',T,2]
-    vis_out = np.stack(vis_list, axis=0).astype(np.bool_)
-
-    # 可复现下采样
-    if max_queries and queries.shape[0] > int(max_queries):
-        rng = np.random.default_rng(int(seed))
-        idx = rng.choice(queries.shape[0], size=int(max_queries), replace=False)
-        idx = np.sort(idx)
-        queries = queries[idx]
-        tracks_out = tracks_out[idx]
-        vis_out = vis_out[idx]
-
-    return queries, tracks_out, vis_out
+def _resize_coords_to_256(
+    pts_xy: np.ndarray,  # [...,2] x,y
+    H: int,
+    W: int,
+    keep_aspect: bool,
+) -> np.ndarray:
+    pts = pts_xy.astype(np.float32).copy()
+    if keep_aspect:
+        scale = min(256.0 / float(W), 256.0 / float(H))
+        newW = float(W) * scale
+        newH = float(H) * scale
+        pad_x = (256.0 - newW) * 0.5
+        pad_y = (256.0 - newH) * 0.5
+        pts[..., 0] = pts[..., 0] * scale + pad_x
+        pts[..., 1] = pts[..., 1] * scale + pad_y
+    else:
+        sx = 256.0 / float(W)
+        sy = 256.0 / float(H)
+        pts[..., 0] = pts[..., 0] * sx
+        pts[..., 1] = pts[..., 1] * sy
+    return pts
 
 
 def build_tapvid_dataset(
     davis_root: str,
     pkl_path: str,
+    res: str = "480p",
     split: str = "davis",
-    query_mode: str = "tapvid",
+    query_mode: str = "tapvid",         # enum: tapvid / strided / first (we treat first specially downstream)
     stride: int = 5,
-    max_queries: int = 0,
+    max_queries: int = 0,               # 0=unlimited
+    resize_to_256: bool = True,
+    keep_aspect: bool = True,
     seed: int = 0,
 ) -> List[TapVidSeq]:
     """
-    Solid contract:
-      - 输入 pkl: dict[name] = {'points':[Q,T,2], 'occluded':[Q,T], 'video':[T,H,W,3] (可选)}
-      - 输出 tracks: gt_tracks_xy [Q',T,2] / gt_vis [Q',T] / queries_txy [Q',3] (t,x,y)
+    Returns sequences with:
+      - gt_tracks_xy [N,T,2] (x,y)
+      - gt_occluded  [N,T]
+      - queries: query_points_tyx [Q,3], query_track_ids [Q]
     """
-    _ = davis_root  # 当前 split=davis 且 pkl 内带 video 时可不需要；先保留接口
-    data = load_tapvid_pkl(pkl_path)
+    if split != "davis":
+        raise ValueError(f"[tapvid] only split='davis' supported for now (got {split!r})")
 
+    raw = load_tapvid_pkl(pkl_path)
+
+    rng = np.random.default_rng(int(seed))
     seqs: List[TapVidSeq] = []
-    for name, ex in data.items():
-        if not isinstance(ex, dict):
-            raise TypeError(f"[tapvid:{name}] each entry must be dict, got {type(ex)}")
-        if "points" not in ex or "occluded" not in ex:
-            raise KeyError(f"[tapvid:{name}] missing keys, need 'points' and 'occluded'")
 
-        points = np.asarray(ex["points"])
-        occ = _ensure_bool(np.asarray(ex["occluded"]))
+    for name, item in raw.items():
+        if not isinstance(item, dict):
+            raise TypeError(f"[tapvid] seq {name!r} must map to dict, got {type(item)}")
 
-        if points.ndim != 3 or points.shape[-1] != 2:
-            raise ValueError(f"[tapvid:{name}] points must be [Q,T,2], got {points.shape}")
-        if occ.shape != points.shape[:2]:
-            raise ValueError(f"[tapvid:{name}] occluded shape {occ.shape} != (Q,T) {points.shape[:2]}")
+        if "points" not in item or "occluded" not in item:
+            raise KeyError(f"[tapvid] seq {name!r} missing keys. Need 'points' and 'occluded'")
 
-        # 解析 H,W：优先用 pkl 内 video
-        frame_paths: List[str] = []
-        if "video" in ex and isinstance(ex["video"], np.ndarray):
-            H, W = _infer_hw_from_video(ex["video"])
+        pts = np.asarray(item["points"], dtype=np.float32)         # [N,T,2]
+        occ = _as_bool(np.asarray(item["occluded"]))               # [N,T]
+
+        if pts.ndim != 3 or pts.shape[-1] != 2:
+            raise ValueError(f"[tapvid] {name}: points must be [N,T,2], got {pts.shape}")
+        if occ.shape != pts.shape[:2]:
+            raise ValueError(f"[tapvid] {name}: occluded shape {occ.shape} != (N,T) {pts.shape[:2]}")
+
+        N, T = int(pts.shape[0]), int(pts.shape[1])
+
+        # video_hw from 'video' if present, else infer from DAVIS res if possible
+        H = W = None
+        if "video" in item and isinstance(item["video"], np.ndarray):
+            vid = item["video"]
+            if vid.ndim != 4 or vid.shape[0] != T or vid.shape[-1] != 3:
+                raise ValueError(f"[tapvid] {name}: video must be [T,H,W,3], got {vid.shape}")
+            H, W = int(vid.shape[1]), int(vid.shape[2])
         else:
-            # 没 video 的情况：你后面如果要从 davis_root 取帧，再在这里补全。
-            # 先给一个明确错误，避免 silent wrong。
-            raise KeyError(
-                f"[tapvid:{name}] missing 'video' array in pkl. "
-                "Either include video in pkl, or implement frame path resolving from davis_root."
-            )
+            # try infer from DAVIS JPEGImages folder by reading nothing (best-effort)
+            # if can't infer, keep coords as-is but require user has 'video' in pkl later.
+            # Here we just set placeholders; downstream resize_to_256 needs H,W.
+            # We'll attempt to infer from res preset:
+            if res == "480p":
+                H = 480
+                W = 854
+            elif res == "1080p":
+                H = 1080
+                W = 1920
+            else:
+                # unknown; require video present
+                raise ValueError(f"[tapvid] {name}: cannot infer video_hw without 'video' for res={res!r}")
 
-        # 坐标系转成 (x,y)
-        order = _infer_xy_order(points, (H, W))
-        tracks_xy = _to_xy(points.astype(np.float32), order=order)  # [Q,T,2] xy
-        vis = (~occ).astype(np.bool_)                                # [Q,T]
+        assert H is not None and W is not None
+        frame_paths = _resolve_davis_frame_paths(davis_root, res, str(name), T)
 
-        # 生成 queries（并在 strided 情况复制样本）
-        queries_txy, tracks_out, vis_out = _make_queries_txy_from_tracks(
-            tracks_xy=tracks_xy,
-            vis=vis,
-            mode=query_mode,
-            stride=int(stride),
-            max_queries=int(max_queries),
-            seed=int(seed),
-        )
+        # build queries
+        q_list: List[Tuple[int, float, float]] = []
+        q_ids: List[int] = []
 
-        if queries_txy.shape[0] == 0:
-            raise ValueError(f"[tapvid:{name}] no queries produced (mode={query_mode})")
+        if query_mode == "tapvid":
+            # one query per track: first visible point
+            for i in range(N):
+                q = _pick_query_for_track(pts[i], occ[i])
+                if q is None:
+                    continue
+                q_list.append(q)
+                q_ids.append(i)
+
+        elif query_mode == "strided":
+            # potentially multiple queries per track (striding on time)
+            if stride <= 0:
+                raise ValueError("[tapvid] stride must be >0 for query_mode='strided'")
+            for i in range(N):
+                # choose t = 0, stride, 2*stride...
+                for t in range(0, T, int(stride)):
+                    if occ[i, t]:
+                        continue
+                    x, y = float(pts[i, t, 0]), float(pts[i, t, 1])
+                    if not (np.isfinite(x) and np.isfinite(y)):
+                        continue
+                    q_list.append((t, y, x))
+                    q_ids.append(i)
+
+        else:
+            raise ValueError(f"[tapvid] unknown query_mode={query_mode!r} (expected 'tapvid' or 'strided')")
+
+        if len(q_list) == 0:
+            # no valid queries -> skip sequence
+            continue
+
+        q_points = np.asarray(q_list, dtype=np.float32)  # [Q,3] (t,y,x)
+        q_track_ids = np.asarray(q_ids, dtype=np.int64)  # [Q]
+
+        # max_queries subsample (reproducible)
+        if int(max_queries) > 0 and q_points.shape[0] > int(max_queries):
+            idx = rng.choice(q_points.shape[0], size=int(max_queries), replace=False)
+            idx = np.sort(idx)
+            q_points = q_points[idx]
+            q_track_ids = q_track_ids[idx]
+
+        # resize coords to 256 if requested
+        if resize_to_256:
+            pts = _resize_coords_to_256(pts, H=H, W=W, keep_aspect=bool(keep_aspect))
+            # q_points: (t,y,x) -> scale x,y consistently
+            xy = np.stack([q_points[:, 2], q_points[:, 1]], axis=-1)  # [Q,2] x,y
+            xy2 = _resize_coords_to_256(xy, H=H, W=W, keep_aspect=bool(keep_aspect))
+            q_points = q_points.copy()
+            q_points[:, 1] = xy2[:, 1]  # y
+            q_points[:, 2] = xy2[:, 0]  # x
 
         seqs.append(
             TapVidSeq(
                 name=str(name),
-                frame_paths=frame_paths,     # 暂时为空：oracle pred/eval 不需要；tracker 接入时再补
+                frame_paths=frame_paths,
                 video_hw=(H, W),
-                gt_tracks_xy=tracks_out,
-                gt_vis=vis_out,
-                queries_txy=queries_txy,
+                gt_tracks_xy=pts.astype(np.float32),         # [N,T,2]
+                gt_occluded=_as_bool(occ),
+                query_points_tyx=q_points.astype(np.float32),
+                query_track_ids=q_track_ids.astype(np.int64),
             )
         )
 
-    if not seqs:
-        raise ValueError(f"[tapvid] empty dataset from pkl={pkl_path}")
+    # keep deterministic ordering
+    seqs.sort(key=lambda s: s.name)
     return seqs
