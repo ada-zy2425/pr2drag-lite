@@ -8,15 +8,15 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-
 @dataclass(frozen=True)
 class TapVidSeq:
     name: str
-    video_hw: Tuple[int, int]          # (H, W) original
-    gt_tracks_xy: np.ndarray           # float32 [N, T, 2] in (x,y) original coords
-    gt_occluded: np.ndarray            # bool [N, T]
-    query_points_tyx: np.ndarray       # float32 [Q, 3] in (t,y,x)
-    query_track_ids: np.ndarray        # int64 [Q] map query->track index
+    frame_paths: list[str]           # len=T; 允许为空（如果你完全走 pkl.video）
+    video_hw: tuple[int, int]        # (H, W)
+    gt_tracks_xy: np.ndarray         # float32 [T, N, 2] (x,y)
+    gt_vis: np.ndarray               # bool    [T, N]
+    queries_txy: np.ndarray          # int/float [Q, 3] (t0, x0, y0)
+    query_track_ids: np.ndarray      # int64   [Q]  每个 query 对应哪个 track（0..N-1）
 
 
 def load_tapvid_pkl(pkl_path: str) -> Dict[str, Any]:
