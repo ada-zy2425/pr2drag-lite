@@ -2,80 +2,65 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple
-
 import numpy as np
 
-
-@dataclass(frozen=True)
-class CoTrackerV2Output:
-    tracks_xy: np.ndarray     # float32 [Q, T, 2] in (x,y)
-    occluded: np.ndarray      # bool    [Q, T] True=occluded
+from .base import TrackerOutput
 
 
-def _require_uint8_video(video: np.ndarray) -> None:
-    if not isinstance(video, np.ndarray):
-        raise TypeError(f"[cotracker_v2] video must be np.ndarray, got {type(video)}")
-    if video.ndim != 4 or video.shape[-1] != 3:
-        raise ValueError(f"[cotracker_v2] video must be [T,H,W,3], got {video.shape}")
-    if video.dtype != np.uint8:
-        raise TypeError(f"[cotracker_v2] video dtype must be uint8, got {video.dtype}")
-
-
-def _require_queries_txy(queries_txy: np.ndarray, T: int) -> None:
-    if not isinstance(queries_txy, np.ndarray):
-        raise TypeError(f"[cotracker_v2] queries must be np.ndarray, got {type(queries_txy)}")
-    if queries_txy.ndim != 2 or queries_txy.shape[1] != 3:
-        raise ValueError(f"[cotracker_v2] queries must be [Q,3] (t,x,y), got {queries_txy.shape}")
-    if queries_txy.size == 0:
-        raise ValueError("[cotracker_v2] queries is empty.")
-    t = np.round(queries_txy[:, 0]).astype(np.int32)
-    if (t < 0).any() or (t >= T).any():
-        raise ValueError(f"[cotracker_v2] query t out of range [0,{T-1}] (min={t.min()}, max={t.max()})")
-
-
-def _import_cotracker_predictor():
-    """
-    Try multiple import paths to be robust across installs.
-    Expected (official-ish) usage:
-        from cotracker.predictor import CoTrackerPredictor
-        pred = CoTrackerPredictor(checkpoint=...)
-        tracks, vis = pred(video, queries=queries)
-    """
+def _require_torch() -> "tuple[Any, Any]":
     try:
-        from cotracker.predictor import CoTrackerPredictor  # type: ignore
-        return CoTrackerPredictor
-    except Exception as e1:
-        try:
-            # alternative older layouts
-            from cotracker.predictor import Predictor as CoTrackerPredictor  # type: ignore
-            return CoTrackerPredictor
-        except Exception:
-            raise ImportError(
-                "[cotracker_v2] Failed to import CoTracker predictor.\n"
-                "Install CoTracker (one of the following usually works):\n"
-                "  - pip install git+https://github.com/facebookresearch/co-tracker\n"
-                "Then restart runtime.\n"
-                f"Original error: {repr(e1)}"
-            )
+        import torch  # type: ignore
+        return torch, torch.cuda
+    except Exception as e:
+        raise ImportError(
+            "[cotracker_v2] Missing dependency: torch. "
+            "Install torch first in your environment."
+        ) from e
 
 
-def _to_torch_video(video_uint8: np.ndarray):
-    import torch
+def _pick_device(torch_mod, device: Optional[str]) -> str:
+    if device is not None and device.strip():
+        return device.strip()
+    if torch_mod.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
-    # [T,H,W,3] uint8 -> [1,T,3,H,W] float in [0,1]
-    v = torch.from_numpy(video_uint8).to(torch.float32) / 255.0
-    v = v.permute(0, 3, 1, 2).unsqueeze(0).contiguous()
+
+def _to_torch_video(torch_mod, video_uint8: np.ndarray, device: str):
+    """
+    video_uint8: [T,H,W,3] uint8
+    returns: torch float32 [1,T,3,H,W] in [0,1]
+    """
+    if not isinstance(video_uint8, np.ndarray) or video_uint8.dtype != np.uint8:
+        raise TypeError(f"[cotracker_v2] video_uint8 must be uint8 ndarray, got {type(video_uint8)} {getattr(video_uint8,'dtype',None)}")
+    if video_uint8.ndim != 4 or video_uint8.shape[-1] != 3:
+        raise ValueError(f"[cotracker_v2] video_uint8 must be [T,H,W,3], got {video_uint8.shape}")
+
+    v = torch_mod.from_numpy(video_uint8).to(device=device)
+    v = v.permute(0, 3, 1, 2).contiguous()  # [T,3,H,W]
+    v = v.unsqueeze(0).float() / 255.0      # [1,T,3,H,W]
     return v
 
 
-def _to_torch_queries(queries_txy: np.ndarray):
-    import torch
+def _queries_txy_to_tyx(queries_txy: np.ndarray) -> np.ndarray:
+    """
+    Input contract in our pipeline: queries_txy is [Q,3] = (t, x, y)
+    CoTracker commonly uses (t, y, x). We convert.
+    """
+    if queries_txy.ndim != 2 or queries_txy.shape[1] != 3:
+        raise ValueError(f"[cotracker_v2] queries_txy must be [Q,3], got {queries_txy.shape}")
+    q = queries_txy.astype(np.float32).copy()
+    t = q[:, 0:1]
+    x = q[:, 1:2]
+    y = q[:, 2:3]
+    return np.concatenate([t, y, x], axis=1)
 
-    # CoTracker expects [1,Q,3] with (t, x, y) in pixel coords
-    q = torch.from_numpy(queries_txy.astype(np.float32)).unsqueeze(0).contiguous()
-    return q
+
+def _safe_bool(x: np.ndarray) -> np.ndarray:
+    if x.dtype == np.bool_:
+        return x
+    return (x.astype(np.int32) != 0)
 
 
 def run_cotracker_v2(
@@ -83,99 +68,129 @@ def run_cotracker_v2(
     queries_txy: np.ndarray,
     checkpoint: Optional[str] = None,
     device: Optional[str] = None,
-) -> CoTrackerV2Output:
+) -> TrackerOutput:
     """
-    Args:
-      video_uint8: [T,H,W,3] uint8
-      queries_txy: [Q,3] float32/int (t,x,y) in SAME pixel space as video
-      checkpoint: optional path to .pth
-    Returns:
-      tracks_xy: [Q,T,2] float32
-      occluded : [Q,T] bool (True=occluded)
+    Returns TrackerOutput with tracks in ORIGINAL video coords (x,y).
+
+    Notes:
+    - This wrapper aims to be robust across minor API differences.
+    - If your cotracker install has different class/function names, adapt only the small import section below.
     """
-    _require_uint8_video(video_uint8)
+    torch, _cuda = _require_torch()
+    dev = _pick_device(torch, device)
+
+    # --- import cotracker (robust)
+    # Try common import paths; if all fail, raise with clear hints.
+    model = None
+    import_errs = []
+    for imp in [
+        "cotracker.models.build_cotracker",
+        "cotracker.models.core.build_cotracker",
+        "cotracker.build_cotracker",
+    ]:
+        try:
+            mod_name, fn_name = imp.rsplit(".", 1)
+            m = __import__(mod_name, fromlist=[fn_name])
+            build_fn = getattr(m, fn_name)
+            model = build_fn(checkpoint=checkpoint) if "checkpoint" in build_fn.__code__.co_varnames else build_fn()
+            break
+        except Exception as e:
+            import_errs.append((imp, repr(e)))
+            model = None
+
+    if model is None:
+        msg = "[cotracker_v2] Could not import/build CoTracker.\nTried:\n"
+        msg += "\n".join([f"  - {p}: {e}" for p, e in import_errs[:6]])
+        msg += "\n\nInstall hint (one of the following):\n"
+        msg += "  - pip install cotracker\n"
+        msg += "  - or install from the official CoTracker repo (editable install)\n"
+        raise ImportError(msg)
+
+    model = model.to(dev)
+    model.eval()
+
+    video_t = _to_torch_video(torch, video_uint8, dev)  # [1,T,3,H,W]
     T = int(video_uint8.shape[0])
-    _require_queries_txy(queries_txy, T=T)
+    H = int(video_uint8.shape[1])
+    W = int(video_uint8.shape[2])
 
-    import torch
+    q_tyx = _queries_txy_to_tyx(np.asarray(queries_txy))
+    Q = int(q_tyx.shape[0])
+    if Q <= 0:
+        raise ValueError("[cotracker_v2] empty queries (Q==0).")
 
-    CoTrackerPredictor = _import_cotracker_predictor()
+    queries_t = torch.from_numpy(q_tyx).to(device=dev).float().unsqueeze(0)  # [1,Q,3]
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    ckpt = None
-    if checkpoint is not None and str(checkpoint).strip():
-        ckpt = str(checkpoint)
-        if not Path(ckpt).exists():
-            raise FileNotFoundError(f"[cotracker_v2] tracker_ckpt not found: {ckpt}")
-
-    # build predictor
-    try:
-        predictor = CoTrackerPredictor(checkpoint=ckpt) if ckpt is not None else CoTrackerPredictor()
-    except TypeError:
-        # some versions require positional
-        predictor = CoTrackerPredictor(ckpt) if ckpt is not None else CoTrackerPredictor()
-
-    # move to device if possible
-    if hasattr(predictor, "model") and hasattr(predictor.model, "to"):
-        predictor.model.to(device)
-
-    video_t = _to_torch_video(video_uint8).to(device)
-    queries_t = _to_torch_queries(queries_txy).to(device)
-
+    # --- forward (robust output parsing)
     with torch.no_grad():
-        out = predictor(video_t, queries=queries_t)
+        out = model(video_t, queries_t) if callable(model) else model.forward(video_t, queries_t)
 
-    # normalize outputs across versions
-    # common: out is (tracks, vis) or dict
-    if isinstance(out, (tuple, list)) and len(out) >= 2:
+    # out could be:
+    #  - tuple(tracks, vis/occ)
+    #  - dict with keys
+    tracks = None
+    occ = None
+
+    if isinstance(out, (tuple, list)) and len(out) >= 1:
         tracks = out[0]
-        vis = out[1]
+        if len(out) >= 2:
+            occ = out[1]
     elif isinstance(out, dict):
-        tracks = out.get("tracks", None)
-        vis = out.get("visibility", None) or out.get("vis", None)
-        if tracks is None or vis is None:
-            raise KeyError(f"[cotracker_v2] unexpected dict output keys: {list(out.keys())}")
+        for k in ["tracks", "pred_tracks", "traj", "trajectories"]:
+            if k in out:
+                tracks = out[k]
+                break
+        for k in ["occluded", "pred_occluded", "occ", "visibility", "vis"]:
+            if k in out:
+                occ = out[k]
+                break
     else:
-        raise TypeError(f"[cotracker_v2] unexpected predictor output type: {type(out)}")
+        tracks = out
 
-    tracks = tracks.detach().float().cpu().numpy()  # [1,Q,T,2] or [1,T,Q,2]
-    vis = vis.detach().float().cpu().numpy()        # [1,Q,T] or [1,T,Q]
+    if tracks is None:
+        raise RuntimeError("[cotracker_v2] CoTracker output parsing failed: no tracks found.")
 
-    # try to canonicalize to [Q,T,2] and [Q,T]
-    tracks = np.asarray(tracks)
-    vis = np.asarray(vis)
+    # tracks common shapes:
+    #  - [1,T,Q,2] or [1,Q,T,2]
+    tracks_np = tracks.detach().float().cpu().numpy()
+    if tracks_np.ndim != 4 or tracks_np.shape[0] != 1 or tracks_np.shape[-1] != 2:
+        raise ValueError(f"[cotracker_v2] unexpected tracks shape: {tracks_np.shape}")
 
-    if tracks.ndim == 4 and tracks.shape[0] == 1:
-        tracks = tracks[0]
-    if vis.ndim == 3 and vis.shape[0] == 1:
-        vis = vis[0]
+    # normalize to [Q,T,2]
+    if tracks_np.shape[1] == T and tracks_np.shape[2] == Q:
+        tracks_qt = tracks_np[0].transpose(1, 0, 2)  # [Q,T,2]
+    elif tracks_np.shape[1] == Q and tracks_np.shape[2] == T:
+        tracks_qt = tracks_np[0]  # [Q,T,2]
+    else:
+        raise ValueError(f"[cotracker_v2] cannot infer T/Q axes from tracks shape: {tracks_np.shape}, expected T={T},Q={Q}")
 
-    # tracks could be [Q,T,2] or [T,Q,2]
-    if tracks.ndim != 3 or tracks.shape[-1] != 2:
-        raise ValueError(f"[cotracker_v2] tracks must be 3D with last dim=2, got {tracks.shape}")
+    # occlusion / visibility handling
+    if occ is None:
+        # conservative: no occlusion head -> assume all visible
+        occ_qt = np.zeros((Q, T), dtype=np.bool_)
+    else:
+        occ_np = occ.detach().cpu().numpy() if hasattr(occ, "detach") else np.asarray(occ)
+        # possible shapes: [1,T,Q] / [1,Q,T] / [T,Q] / [Q,T]
+        if occ_np.ndim == 3 and occ_np.shape[0] == 1:
+            occ_np = occ_np[0]
+        if occ_np.shape == (T, Q):
+            occ_qt = _safe_bool(occ_np.transpose(1, 0))
+        elif occ_np.shape == (Q, T):
+            occ_qt = _safe_bool(occ_np)
+        else:
+            # if it's a prob/score, squeeze and threshold
+            occ_np = np.squeeze(occ_np)
+            if occ_np.shape == (T, Q):
+                occ_qt = (occ_np.transpose(1, 0) < 0.5) if "vis" in str(type(occ)).lower() else (occ_np.transpose(1, 0) > 0.5)
+                occ_qt = _safe_bool(occ_qt)
+            elif occ_np.shape == (Q, T):
+                occ_qt = (occ_np < 0.5) if "vis" in str(type(occ)).lower() else (occ_np > 0.5)
+                occ_qt = _safe_bool(occ_qt)
+            else:
+                raise ValueError(f"[cotracker_v2] unexpected occlusion/vis shape: {occ_np.shape}")
 
-    if tracks.shape[0] == T and tracks.shape[1] == queries_txy.shape[0]:
-        # [T,Q,2] -> [Q,T,2]
-        tracks = np.transpose(tracks, (1, 0, 2))
-
-    Q = int(queries_txy.shape[0])
-    if tracks.shape[0] != Q or tracks.shape[1] != T:
-        raise ValueError(f"[cotracker_v2] tracks shape mismatch, got {tracks.shape}, expected [Q,T,2]=[{Q},{T},2]")
-
-    # vis could be [Q,T] or [T,Q]
-    if vis.ndim != 2:
-        raise ValueError(f"[cotracker_v2] visibility must be 2D, got {vis.shape}")
-    if vis.shape[0] == T and vis.shape[1] == Q:
-        vis = vis.T
-    if vis.shape != (Q, T):
-        raise ValueError(f"[cotracker_v2] visibility shape mismatch, got {vis.shape}, expected {(Q,T)}")
-
-    # occluded = (vis < 0.5)
-    occluded = (vis < 0.5)
-
-    return CoTrackerV2Output(
-        tracks_xy=tracks.astype(np.float32),
-        occluded=occluded.astype(bool),
+    return TrackerOutput(
+        tracks_xy=tracks_qt.astype(np.float32),  # (x,y) in original coords expected by most trackers
+        occluded=occ_qt.astype(np.bool_),
+        video_hw=(H, W),
     )
