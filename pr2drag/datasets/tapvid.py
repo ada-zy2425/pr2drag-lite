@@ -18,7 +18,6 @@ class TapVidSeq:
     queries_txy: np.ndarray          # int/float [Q, 3] (t0, x0, y0)
     query_track_ids: np.ndarray      # int64   [Q]  每个 query 对应哪个 track（0..N-1）
 
-
 def load_tapvid_pkl(pkl_path: str) -> Dict[str, Any]:
     p = Path(pkl_path)
     if not p.exists():
