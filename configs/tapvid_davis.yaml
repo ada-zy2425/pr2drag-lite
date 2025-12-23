@@ -13,7 +13,7 @@ tapvid:
   max_queries: 0         # 0=不限制；>0 则下采样到固定数量（可复现）
 
   # tracker / preds
-  tracker: "oracle"
+  tracker: "cotracker_v2"
   tracker_ckpt: ""       # 可空；为空则用 tracker 默认
   pred_dir: ""           # 若为空 -> 默认: {base_out}/tapvid_preds/{tracker}_{query_mode}
   overwrite_preds: false # pred 已存在是否重算
