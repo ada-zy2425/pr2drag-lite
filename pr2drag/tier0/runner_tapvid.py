@@ -70,49 +70,81 @@ def _call_run_cotracker_v2(
     """
     Robustly call run_cotracker_v2 across different API variants.
 
-    We have queries in TAP-Vid format: [Q,3] (t,y,x).
-    Some implementations expect:
-      - queries_tyx
-      - queries_txy  (t,x,y)
-      - query_points / queries
+    Handles different argument names:
+      video: video_uint8 / video / frames / imgs
+      queries: queries_tyx / queries_txy / query_points / queries
+      ckpt: checkpoint / checkpoint_path / ckpt / model_path
+      device: device / torch_device
     """
     sig = inspect.signature(run_fn)
-    params = set(sig.parameters.keys())
+    params = sig.parameters
+    param_names = set(params.keys())
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
+    def _accepts(name: str) -> bool:
+        return has_varkw or (name in param_names)
+
+    # ---- queries (we have tyx; some expect txy)
     q_tyx = np.asarray(queries_tyx, dtype=np.float32)
     _require(q_tyx.ndim == 2 and q_tyx.shape[1] == 3, f"[tapvid] queries_tyx must be [Q,3], got {q_tyx.shape}")
 
-    # convert tyx -> txy if needed
     q_txy = q_tyx.copy()
     q_txy[:, 1] = q_tyx[:, 2]  # x
     q_txy[:, 2] = q_tyx[:, 1]  # y
 
-    kwargs = {
-        "video_uint8": video_uint8,
-        "checkpoint": checkpoint,
-        "device": device,
-    }
+    # ---- build kwargs only with accepted keys
+    kwargs: dict[str, Any] = {}
 
-    if "queries_tyx" in params:
+    # video arg name
+    if _accepts("video_uint8"):
+        kwargs["video_uint8"] = video_uint8
+    elif _accepts("video"):
+        kwargs["video"] = video_uint8
+    elif _accepts("frames"):
+        kwargs["frames"] = video_uint8
+    elif _accepts("imgs"):
+        kwargs["imgs"] = video_uint8
+    else:
+        raise TypeError(
+            "[tapvid_pred] run_cotracker_v2 signature has no recognized video argument. "
+            f"params={sorted(param_names)}"
+        )
+
+    # query arg name
+    if _accepts("queries_tyx"):
         kwargs["queries_tyx"] = q_tyx
-    elif "queries_txy" in params:
+    elif _accepts("queries_txy"):
         kwargs["queries_txy"] = q_txy
-    elif "query_points" in params:
-        # ambiguous: assume t,y,x is more common for "points"
+    elif _accepts("query_points"):
+        # ambiguous; choose tyx
         kwargs["query_points"] = q_tyx
-    elif "queries" in params:
+    elif _accepts("queries"):
+        # ambiguous; choose tyx
         kwargs["queries"] = q_tyx
     else:
         raise TypeError(
-            "[tapvid_pred] run_cotracker_v2 signature does not accept any known query argument name. "
-            f"Available params={sorted(params)}. Expected one of: queries_tyx / queries_txy / query_points / queries"
+            "[tapvid_pred] run_cotracker_v2 signature has no recognized queries argument. "
+            f"params={sorted(param_names)}"
         )
 
-    # drop None keys if backend doesn't accept them
-    if "checkpoint" in params and kwargs.get("checkpoint") is None:
-        kwargs.pop("checkpoint")
-    if "device" in params and kwargs.get("device") is None:
-        kwargs.pop("device")
+    # checkpoint / device (optional)
+    if checkpoint is not None:
+        if _accepts("checkpoint"):
+            kwargs["checkpoint"] = checkpoint
+        elif _accepts("checkpoint_path"):
+            kwargs["checkpoint_path"] = checkpoint
+        elif _accepts("ckpt"):
+            kwargs["ckpt"] = checkpoint
+        elif _accepts("model_path"):
+            kwargs["model_path"] = checkpoint
+        # else: silently drop (some implementations hardcode weights)
+
+    if device is not None:
+        if _accepts("device"):
+            kwargs["device"] = device
+        elif _accepts("torch_device"):
+            kwargs["torch_device"] = device
+        # else: drop
 
     return run_fn(**kwargs)
 
