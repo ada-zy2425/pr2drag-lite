@@ -1,0 +1,30 @@
+dataset: tapvid
+
+davis_root: "/content/drive/MyDrive/DAVIS_unzipped/DAVIS"   # 用于取 DAVIS 帧（TAP-Vid DAVIS split）
+base_out: "/content/drive/MyDrive/pr2drag_data"
+
+tapvid:
+  split: "davis"
+  pkl_path: "/content/drive/MyDrive/tapvid/tapvid_davis/tapvid_davis.pkl"
+
+  # queries
+  query_mode: "tapvid"   # enum: [tapvid, strided]
+  stride: 5              # only when strided
+  max_queries: 0         # 0=不限制；>0 则下采样到固定数量（可复现）
+
+  # tracker / preds
+  tracker: "tapir"       # enum: [tapir, cotracker_v2, none]
+  tracker_ckpt: ""       # 可空；为空则用 tracker 默认
+  pred_dir: ""           # 若为空 -> 默认: {base_out}/tapvid_preds/{tracker}_{query_mode}
+  overwrite_preds: false # pred 已存在是否重算
+
+  # resize / coord
+  resize_to_256: true
+  keep_aspect: true
+  interp: "bilinear"     # enum: [bilinear, nearest]  (mask 用 nearest，但这里是点)
+
+  # eval output
+  out_dir: ""            # 若为空 -> 默认: {base_out}/tapvid_reports/{tracker}_{query_mode}
+  allow_missing_preds: false
+  fail_fast: false       # true=遇到任何 seq 失败立刻退出
+  seed: 0

@@ -282,6 +282,11 @@ def _dispatch(cmd: str, cfg: Dict[str, Any], paths: Dict[str, Path]) -> None:
         if cmd == "stage3":
             stage3_train_eval(cfg, stage2_train=out_train_s2, stage2_val=out_val_s2, out_dir=out_dir_s3)
             return
+        
+        if cmd == "tapvid_eval":
+            from pr2drag.tapvid_eval import tapvid_eval_from_config
+            tapvid_eval_from_config(args.config)
+            return  
 
         if cmd == "run_tapvid_tier0":
             raise ValueError("cmd=run_tapvid_tier0 requires dataset=tapvid (current config is dataset=davis).")

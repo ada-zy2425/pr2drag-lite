@@ -6,3 +6,25 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# ---- datasets / local data ----
+DAVIS/
+tapvid_davis/
+tapvid_davis/**
+
+# ---- common large artifacts ----
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+
+# ---- runs / outputs ----
+runs/
+outputs/
+wandb/
+__pycache__/
+.ipynb_checkpoints/
