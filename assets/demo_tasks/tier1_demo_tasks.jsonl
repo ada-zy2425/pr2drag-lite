@@ -1,0 +1,6 @@
+{"task_id": "demo_task_000", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "easy"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}
+{"task_id": "demo_task_001", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "medium"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}
+{"task_id": "demo_task_002", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "hard"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}
+{"task_id": "demo_task_003", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "easy"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}
+{"task_id": "demo_task_004", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "medium"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}
+{"task_id": "demo_task_005", "video_path": "/dev/null", "T": 24, "meta": {"difficulty": "hard"}, "guidance": {"source_points": [[10, 10], [20, 20]], "target_points": [[30, 10], [40, 20]]}}

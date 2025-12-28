@@ -1,0 +1,15 @@
+numpy>=1.23
+scipy>=1.10
+pyyaml>=6.0
+tqdm>=4.66
+matplotlib>=3.7
+pandas>=2.0
+
+# 可选（Tier-0 训练/校准更方便）
+# scikit-learn>=1.2
+
+# 可选（若用 MLP posterior / 真实 diffusion editor）
+# torch>=2.0
+
+# 可选（若你需要读视频/做mask等）
+# opencv-python-headless>=4.8

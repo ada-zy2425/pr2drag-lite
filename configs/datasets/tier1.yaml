@@ -1,0 +1,4 @@
+dataset:
+  name: tier1_template
+  tier: tier1
+  tasks_file: /path/to/tier1_tasks.jsonl

@@ -1,0 +1,6 @@
+editor:
+  name: editor_a
+  type: editor_a
+  params:
+    # 你接入真实 diffusion editor 后在这里填参数
+    placeholder: true

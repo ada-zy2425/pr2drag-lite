@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pr2-control"
+version = "0.1.0"
+description = "PR^2-Control experiment framework (posterior->policy->editor adapters)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name="Anonymous"}]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "matplotlib>=3.7",
+  "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+ml = ["scikit-learn>=1.2", "torch>=2.0"]
+video = ["opencv-python-headless>=4.8"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pr2*"]

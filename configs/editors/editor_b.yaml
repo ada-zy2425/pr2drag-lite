@@ -1,0 +1,5 @@
+editor:
+  name: editor_b
+  type: editor_b
+  params:
+    placeholder: true

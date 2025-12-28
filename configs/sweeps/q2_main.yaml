@@ -1,0 +1,8 @@
+# 你可以用它来定义方法对比 sweep（Vanilla/HardGate/LossOnly/Full 等）
+sweep:
+  name: q2_main
+  methods:
+    - vanilla
+    - hard_gate
+    - loss_only
+    - pr2_full

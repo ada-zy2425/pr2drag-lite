@@ -1,0 +1,25 @@
+policy:
+  name: pr2_default
+  schedules:
+    radius:
+      R_min: 0.05
+      R_max: 1.00
+      alpha: 2.0
+    gmax:
+      g_min: 1.0
+      g_max0: 7.5
+      beta: 1.0
+    lambda_safe:
+      a: 10.0
+      b: 0.5
+  completion:
+    enabled: true
+    max_seg_len: 12
+    v_max: 40.0
+    solver: minaccel
+    fallback: abstain
+  thresholding:
+    method: fixed
+    tau: 0.55
+    target_risk: 0.10
+    alpha: 0.10

@@ -1,0 +1,50 @@
+# 默认配置：用于 demo 自测 + 作为你的真实实验基线模板
+seed: 123
+device: auto
+
+dataset:
+  name: tier1_demo
+  tier: tier1
+
+editor:
+  name: dummy
+  type: dummy
+  params:
+    T_default: 24
+
+policy:
+  name: pr2_default
+  # 如果你已经通过 crc_threshold 选出了 tau，可以填在这里
+  # tau: 0.5
+  schedules:
+    radius:
+      R_min: 0.05
+      R_max: 1.00
+      alpha: 2.0
+    gmax:
+      g_min: 1.0
+      g_max0: 7.5
+      beta: 1.0
+    lambda_safe:
+      a: 10.0
+      b: 0.5
+  completion:
+    enabled: true
+    max_seg_len: 12
+    v_max: 40.0
+    solver: minaccel        # [minaccel, linear]
+    fallback: abstain       # [abstain, linear]
+  thresholding:
+    method: fixed           # [fixed, crc_cp]
+    tau: 0.55
+    target_risk: 0.10
+    alpha: 0.10             # miscoverage for CP bound if method=crc_cp
+
+logging:
+  save_frame_log: true
+  save_artifacts: false
+  log_every: 1
+
+runtime:
+  resume: true
+  num_workers: 0

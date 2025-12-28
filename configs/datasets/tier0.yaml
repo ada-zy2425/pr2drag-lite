@@ -1,0 +1,6 @@
+dataset:
+  name: tier0_template
+  tier: tier0
+  # 你自己准备的 evidence+label 数据（建议 jsonl 或 npz）
+  calib_file: /path/to/tier0_calib.jsonl
+  test_file: /path/to/tier0_test.jsonl

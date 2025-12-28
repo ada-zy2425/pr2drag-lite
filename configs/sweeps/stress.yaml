@@ -1,0 +1,7 @@
+sweep:
+  name: stress
+  noise_levels: [0, 1, 2, 3]
+  methods:
+    - vanilla
+    - loss_only
+    - pr2_full
